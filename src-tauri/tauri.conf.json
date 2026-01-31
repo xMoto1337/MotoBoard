@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "MotoBoard",
-    "version": "1.0.11"
+    "version": "1.1.0"
   },
   "tauri": {
     "allowlist": {
@@ -40,7 +40,7 @@
       "endpoints": [
         "https://github.com/xMoto1337/MotoBoard/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENFNTA1MTk3ODkzMUNCNkUKUldSdXl6R0psMUZRenR6ZHo5dk15WXZoTUVWMEhZR283T1JaU3lxdVlMTW4yR0hUdkF0d0JCUDMK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEMxNzU0N0RBOThFMEVDODUKUldTRjdPQ1kya2Qxd2JuM2w1QTErT1BtOGpaSkl0dmFjWWxMcWhaMUxOK0VLL0t1MnVNaW1ISUcK"
     },
     "bundle": {
       "active": true,
