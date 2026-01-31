@@ -41,6 +41,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Debug - Check if signing keys are set
+        run: |
+          echo "TAURI_PRIVATE_KEY length: ${{ secrets.TAURI_PRIVATE_KEY != '' && 'SET' || 'NOT SET' }}"
+          echo "TAURI_KEY_PASSWORD length: ${{ secrets.TAURI_KEY_PASSWORD != '' && 'SET' || 'NOT SET' }}"
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -62,3 +67,13 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+
+      - name: Debug - List built files
+        if: always()
+        run: |
+          echo "=== Listing target/release/bundle ==="
+          dir src-tauri\target\release\bundle /s
+          echo "=== Looking for .sig files ==="
+          dir src-tauri\target\release\bundle\*.sig /s 2>nul || echo "No .sig files found"
+          echo "=== Looking for latest.json ==="
+          dir src-tauri\target\release\bundle\*latest*.json /s 2>nul || echo "No latest.json found"
