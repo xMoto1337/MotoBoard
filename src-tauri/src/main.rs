@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-use tauri::{State, Manager, AppHandle, GlobalShortcutManager, api::process::restart};
+use tauri::{State, Manager, AppHandle, GlobalShortcutManager, api::process::restart, SystemTray, SystemTrayMenu, SystemTrayMenuItem, CustomMenuItem, SystemTrayEvent};
 use uuid::Uuid;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 
@@ -83,6 +83,16 @@ struct PersistentSettings {
     master_volume: f32,
     #[serde(rename = "stopAllKeybind")]
     stop_all_keybind: Option<String>,
+    #[serde(rename = "compactMode", default)]
+    compact_mode: bool,
+    #[serde(default = "default_theme")]
+    theme: String,
+    #[serde(rename = "minimizeToTray", default)]
+    minimize_to_tray: bool,
+}
+
+fn default_theme() -> String {
+    "green".to_string()
 }
 
 // Save settings to file
@@ -98,6 +108,9 @@ fn save_settings(state: &AudioState) {
             monitor_device: state.monitor_device.clone(),
             master_volume: state.master_volume,
             stop_all_keybind: state.stop_all_keybind.clone(),
+            compact_mode: state.compact_mode,
+            theme: state.theme.clone(),
+            minimize_to_tray: state.minimize_to_tray,
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             if let Ok(mut file) = File::create(&settings_file) {
@@ -138,6 +151,8 @@ struct Sound {
     start_time: Option<f64>,
     #[serde(rename = "endTime")]
     end_time: Option<f64>,
+    #[serde(default)]
+    order: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +165,11 @@ struct Settings {
     master_volume: f32,
     #[serde(rename = "stopAllKeybind")]
     stop_all_keybind: Option<String>,
+    #[serde(rename = "compactMode")]
+    compact_mode: bool,
+    theme: String,
+    #[serde(rename = "minimizeToTray")]
+    minimize_to_tray: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +184,9 @@ struct AudioState {
     monitor_device: Option<String>,
     master_volume: f32,
     stop_all_keybind: Option<String>,
+    compact_mode: bool,
+    theme: String,
+    minimize_to_tray: bool,
 }
 
 impl Default for AudioState {
@@ -174,6 +197,9 @@ impl Default for AudioState {
             monitor_device: None,
             master_volume: 0.8,
             stop_all_keybind: None,
+            compact_mode: false,
+            theme: "green".to_string(),
+            minimize_to_tray: false,
         }
     }
 }
@@ -233,7 +259,9 @@ fn set_master_volume(volume: f32, state: State<AppState>) -> Result<(), String> 
 #[tauri::command]
 fn get_sounds(state: State<AppState>) -> Vec<Sound> {
     let audio_state = state.lock().unwrap();
-    audio_state.sounds.values().cloned().collect()
+    let mut sounds: Vec<Sound> = audio_state.sounds.values().cloned().collect();
+    sounds.sort_by_key(|s| s.order);
+    sounds
 }
 
 #[tauri::command]
@@ -244,6 +272,9 @@ fn get_settings(state: State<AppState>) -> Settings {
         monitor_device: audio_state.monitor_device.clone(),
         master_volume: audio_state.master_volume,
         stop_all_keybind: audio_state.stop_all_keybind.clone(),
+        compact_mode: audio_state.compact_mode,
+        theme: audio_state.theme.clone(),
+        minimize_to_tray: audio_state.minimize_to_tray,
     }
 }
 
@@ -251,6 +282,30 @@ fn get_settings(state: State<AppState>) -> Settings {
 fn set_stop_all_keybind(keybind: Option<String>, state: State<AppState>) -> Result<(), String> {
     let mut audio_state = state.lock().map_err(|e| e.to_string())?;
     audio_state.stop_all_keybind = keybind;
+    save_settings(&audio_state);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_compact_mode(enabled: bool, state: State<AppState>) -> Result<(), String> {
+    let mut audio_state = state.lock().map_err(|e| e.to_string())?;
+    audio_state.compact_mode = enabled;
+    save_settings(&audio_state);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_theme(theme: String, state: State<AppState>) -> Result<(), String> {
+    let mut audio_state = state.lock().map_err(|e| e.to_string())?;
+    audio_state.theme = theme;
+    save_settings(&audio_state);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_minimize_to_tray(enabled: bool, state: State<AppState>) -> Result<(), String> {
+    let mut audio_state = state.lock().map_err(|e| e.to_string())?;
+    audio_state.minimize_to_tray = enabled;
     save_settings(&audio_state);
     Ok(())
 }
@@ -269,6 +324,12 @@ fn add_sound_from_path(file_path: String, state: State<AppState>) -> Result<Soun
         .unwrap_or("Untitled")
         .to_string();
 
+    // Calculate order based on current sound count
+    let order = {
+        let audio_state = state.lock().map_err(|e| e.to_string())?;
+        audio_state.sounds.len() as i32
+    };
+
     let sound = Sound {
         id: Uuid::new_v4().to_string(),
         name,
@@ -277,6 +338,7 @@ fn add_sound_from_path(file_path: String, state: State<AppState>) -> Result<Soun
         file_path,
         start_time: None,
         end_time: None,
+        order,
     };
 
     let mut audio_state = state.lock().map_err(|e| e.to_string())?;
@@ -319,6 +381,18 @@ fn update_sound_trim(
     if let Some(sound) = audio_state.sounds.get_mut(&sound_id) {
         sound.start_time = start_time;
         sound.end_time = end_time;
+    }
+    save_sounds(&audio_state.sounds);
+    Ok(())
+}
+
+#[tauri::command]
+fn update_sound_order(sound_ids: Vec<String>, state: State<AppState>) -> Result<(), String> {
+    let mut audio_state = state.lock().map_err(|e| e.to_string())?;
+    for (index, sound_id) in sound_ids.iter().enumerate() {
+        if let Some(sound) = audio_state.sounds.get_mut(sound_id) {
+            sound.order = index as i32;
+        }
     }
     save_sounds(&audio_state.sounds);
     Ok(())
@@ -671,6 +745,9 @@ fn main() {
             initial_state.monitor_device = settings.monitor_device;
             initial_state.master_volume = settings.master_volume;
             initial_state.stop_all_keybind = settings.stop_all_keybind;
+            initial_state.compact_mode = settings.compact_mode;
+            initial_state.theme = settings.theme;
+            initial_state.minimize_to_tray = settings.minimize_to_tray;
         }
     }
 
@@ -686,9 +763,69 @@ fn main() {
         })
         .collect();
 
+    // Clone minimize_to_tray for use in window close handler
+    let minimize_to_tray_setting = initial_state.minimize_to_tray;
+
     let audio_state: AppState = Arc::new(Mutex::new(initial_state));
+    let audio_state_for_tray = audio_state.clone();
+
+    // Create system tray menu
+    let show = CustomMenuItem::new("show".to_string(), "Show MotoBoard");
+    let stop_all_menu = CustomMenuItem::new("stop_all".to_string(), "Stop All Sounds");
+    let quit = CustomMenuItem::new("quit".to_string(), "Quit");
+    let tray_menu = SystemTrayMenu::new()
+        .add_item(show)
+        .add_item(stop_all_menu)
+        .add_native_item(SystemTrayMenuItem::Separator)
+        .add_item(quit);
+    let system_tray = SystemTray::new().with_menu(tray_menu);
 
     tauri::Builder::default()
+        .system_tray(system_tray)
+        .on_system_tray_event(move |app, event| {
+            match event {
+                SystemTrayEvent::LeftClick { .. } => {
+                    if let Some(window) = app.get_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+                SystemTrayEvent::MenuItemClick { id, .. } => {
+                    match id.as_str() {
+                        "show" => {
+                            if let Some(window) = app.get_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "stop_all" => {
+                            STOP_ALL_FLAG.store(true, Ordering::SeqCst);
+                        }
+                        "quit" => {
+                            std::process::exit(0);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        })
+        .on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
+                // Check current minimize_to_tray setting
+                let should_minimize = if let Ok(state) = audio_state_for_tray.lock() {
+                    state.minimize_to_tray
+                } else {
+                    minimize_to_tray_setting
+                };
+
+                if should_minimize {
+                    // Hide window instead of closing
+                    let _ = event.window().hide();
+                    api.prevent_close();
+                }
+            }
+        })
         .manage(audio_state)
         .invoke_handler(tauri::generate_handler![
             get_audio_devices,
@@ -701,6 +838,7 @@ fn main() {
             remove_sound,
             update_sound_keybind,
             update_sound_trim,
+            update_sound_order,
             play_sound,
             stop_all,
             register_sound_keybind,
@@ -708,6 +846,9 @@ fn main() {
             register_stop_all_keybind,
             unregister_stop_all_keybind,
             set_stop_all_keybind,
+            set_compact_mode,
+            set_theme,
+            set_minimize_to_tray,
             get_current_version,
             check_for_updates,
             install_update,

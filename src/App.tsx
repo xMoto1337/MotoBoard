@@ -11,6 +11,7 @@ interface Sound {
   filePath: string
   startTime?: number
   endTime?: number
+  order: number
 }
 
 interface AudioDevice {
@@ -43,6 +44,9 @@ function App() {
   const [fadeInDuration, setFadeInDuration] = useState(0)
   const [fadeOutDuration, setFadeOutDuration] = useState(0)
   const [showConsole, setShowConsole] = useState(true)
+  const [compactMode, setCompactMode] = useState(false)
+  const [theme, setTheme] = useState<string>('green')
+  const [minimizeToTray, setMinimizeToTray] = useState(false)
   const [waveformData, setWaveformData] = useState<number[]>([])
   const [audioDuration, setAudioDuration] = useState(0)
   const [isPreviewPlaying, setIsPreviewPlaying] = useState(false)
@@ -50,6 +54,8 @@ function App() {
   const [updateStatus, setUpdateStatus] = useState<'checking' | 'up-to-date' | 'update-available' | 'error'>('checking')
   const [latestVersion, setLatestVersion] = useState<string>('')
   const [isUpdating, setIsUpdating] = useState(false)
+  const [draggedSound, setDraggedSound] = useState<string | null>(null)
+  const [dragOverSound, setDragOverSound] = useState<string | null>(null)
   const consoleRef = useRef<HTMLDivElement>(null)
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null)
   const previewAudioRef = useRef<HTMLAudioElement | null>(null)
@@ -219,6 +225,9 @@ function App() {
         monitorDevice?: string
         masterVolume?: number
         stopAllKeybind?: string
+        compactMode?: boolean
+        theme?: string
+        minimizeToTray?: boolean
       }>('get_settings')
 
       if (settings.primaryDevice) {
@@ -233,6 +242,15 @@ function App() {
       if (settings.stopAllKeybind) {
         setStopAllKeybind(settings.stopAllKeybind)
         addLog(`Loaded Stop All keybind: ${settings.stopAllKeybind}`, 'info')
+      }
+      if (settings.compactMode !== undefined) {
+        setCompactMode(settings.compactMode)
+      }
+      if (settings.theme) {
+        setTheme(settings.theme)
+      }
+      if (settings.minimizeToTray !== undefined) {
+        setMinimizeToTray(settings.minimizeToTray)
       }
 
       return { hasSavedPrimaryDevice: !!settings.primaryDevice }
@@ -550,6 +568,120 @@ function App() {
     }
   }
 
+  const handleCompactModeChange = async (enabled: boolean) => {
+    setCompactMode(enabled)
+    try {
+      await invoke('set_compact_mode', { enabled })
+      addLog(`Compact mode ${enabled ? 'enabled' : 'disabled'}`, 'success')
+    } catch (error) {
+      addLog(`✗ Failed to set compact mode: ${error}`, 'error')
+    }
+  }
+
+  const handleThemeChange = async (newTheme: string) => {
+    setTheme(newTheme)
+    try {
+      await invoke('set_theme', { theme: newTheme })
+      addLog(`Theme changed to ${newTheme}`, 'success')
+    } catch (error) {
+      addLog(`✗ Failed to set theme: ${error}`, 'error')
+    }
+  }
+
+  const handleMinimizeToTrayChange = async (enabled: boolean) => {
+    setMinimizeToTray(enabled)
+    try {
+      await invoke('set_minimize_to_tray', { enabled })
+      addLog(`Minimize to tray ${enabled ? 'enabled' : 'disabled'}`, 'success')
+    } catch (error) {
+      addLog(`✗ Failed to set minimize to tray: ${error}`, 'error')
+    }
+  }
+
+  // Apply theme and compact mode to document
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    document.documentElement.setAttribute('data-compact', String(compactMode))
+  }, [theme, compactMode])
+
+  // Drag and drop handlers
+  const handleDragStart = (e: React.DragEvent, soundId: string) => {
+    e.stopPropagation()
+    setDraggedSound(soundId)
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', soundId)
+
+    // Add a slight delay for visual feedback
+    setTimeout(() => {
+      const card = document.querySelector(`[data-sound-id="${soundId}"]`) as HTMLElement
+      if (card) {
+        card.classList.add('dragging')
+      }
+    }, 0)
+  }
+
+  const handleDragEnd = (e: React.DragEvent) => {
+    e.stopPropagation()
+    // Remove dragging class from all cards
+    document.querySelectorAll('.sound-card.dragging').forEach(el => {
+      el.classList.remove('dragging')
+    })
+    setDraggedSound(null)
+    setDragOverSound(null)
+  }
+
+  const handleDragOver = (e: React.DragEvent, soundId: string) => {
+    e.preventDefault()
+    e.stopPropagation()
+    e.dataTransfer.dropEffect = 'move'
+    if (draggedSound && soundId !== draggedSound) {
+      setDragOverSound(soundId)
+    }
+  }
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.stopPropagation()
+    setDragOverSound(null)
+  }
+
+  const handleDrop = async (e: React.DragEvent, targetSoundId: string) => {
+    e.preventDefault()
+    e.stopPropagation()
+
+    if (!draggedSound || draggedSound === targetSoundId) {
+      setDraggedSound(null)
+      setDragOverSound(null)
+      return
+    }
+
+    // Reorder sounds
+    const draggedIndex = sounds.findIndex(s => s.id === draggedSound)
+    const targetIndex = sounds.findIndex(s => s.id === targetSoundId)
+
+    if (draggedIndex === -1 || targetIndex === -1) return
+
+    const newSounds = [...sounds]
+    const [removed] = newSounds.splice(draggedIndex, 1)
+    newSounds.splice(targetIndex, 0, removed)
+
+    // Update local state immediately
+    setSounds(newSounds)
+
+    // Save new order to backend
+    try {
+      const soundIds = newSounds.map(s => s.id)
+      await invoke('update_sound_order', { soundIds })
+      addLog('Sound order updated', 'success')
+    } catch (error) {
+      addLog(`Failed to update order: ${error}`, 'error')
+      // Reload sounds on error
+      loadSounds()
+    }
+
+    setDraggedSound(null)
+    setDragOverSound(null)
+  }
+
   return (
     <>
       {/* Header */}
@@ -596,10 +728,25 @@ function App() {
         {/* Sound Grid */}
         <div className="sound-grid">
           {sounds.map((sound) => (
-            <div key={sound.id} className="sound-card">
+            <div
+              key={sound.id}
+              data-sound-id={sound.id}
+              className={`sound-card ${draggedSound === sound.id ? 'dragging' : ''} ${dragOverSound === sound.id ? 'drag-over' : ''}`}
+              draggable={true}
+              onDragStart={(e) => handleDragStart(e, sound.id)}
+              onDragEnd={(e) => handleDragEnd(e)}
+              onDragOver={(e) => handleDragOver(e, sound.id)}
+              onDragLeave={(e) => handleDragLeave(e)}
+              onDrop={(e) => handleDrop(e, sound.id)}
+            >
               <button
                 className={`sound-btn ${playingSound === sound.id ? 'playing' : ''}`}
-                onClick={() => playSound(sound.id)}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  playSound(sound.id)
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+                draggable={false}
               >
                 <span className="sound-btn-name">{sound.name}</span>
                 {sound.keybind && (
@@ -608,8 +755,13 @@ function App() {
               </button>
               <button
                 className="sound-edit-btn"
-                onClick={() => setEditingSound(sound)}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setEditingSound(sound)
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
                 title="Edit sound"
+                draggable={false}
               >
                 ⚙
               </button>
@@ -828,6 +980,49 @@ function App() {
                     <span>Show console panel</span>
                   </label>
                   <p className="settings-hint">Display the log console at the bottom</p>
+                </div>
+                <div className="settings-item">
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={compactMode}
+                      onChange={(e) => handleCompactModeChange(e.target.checked)}
+                    />
+                    <span>Compact mode</span>
+                  </label>
+                  <p className="settings-hint">Smaller buttons to fit more sounds on screen</p>
+                </div>
+                <div className="settings-item">
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={minimizeToTray}
+                      onChange={(e) => handleMinimizeToTrayChange(e.target.checked)}
+                    />
+                    <span>Minimize to tray</span>
+                  </label>
+                  <p className="settings-hint">Keep running in system tray when closed</p>
+                </div>
+              </div>
+
+              {/* Theme */}
+              <div className="settings-section">
+                <h3>Theme</h3>
+                <div className="settings-item">
+                  <label>Color Scheme</label>
+                  <div className="theme-select">
+                    {['green', 'purple', 'blue', 'red', 'cyan', 'orange', 'pink'].map((t) => (
+                      <button
+                        key={t}
+                        className={`theme-option ${theme === t ? 'active' : ''}`}
+                        data-theme={t}
+                        onClick={() => handleThemeChange(t)}
+                        title={t.charAt(0).toUpperCase() + t.slice(1)}
+                      >
+                        <div className="theme-color" />
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             </div>
