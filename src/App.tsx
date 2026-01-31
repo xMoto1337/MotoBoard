@@ -22,7 +22,7 @@ interface AudioDevice {
 interface LogEntry {
   timestamp: string
   message: string
-  type: 'info' | 'success' | 'error'
+  type: 'info' | 'success' | 'error' | 'debug' | 'warn'
 }
 
 function App() {
@@ -59,6 +59,7 @@ function App() {
   const consoleRef = useRef<HTMLDivElement>(null)
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null)
   const previewAudioRef = useRef<HTMLAudioElement | null>(null)
+  const initializedRef = useRef(false)
 
   const addLog = (message: string, type: LogEntry['type'] = 'info') => {
     const now = new Date()
@@ -91,9 +92,9 @@ function App() {
   const registerSoundKeybind = async (soundId: string, keybind: string) => {
     try {
       await invoke('register_sound_keybind', { soundId, keybind })
-      addLog(`Global keybind registered: ${keybind}`, 'success')
+      addLog(`[Keybind] Registered global: ${keybind}`, 'success')
     } catch (error) {
-      addLog(`Failed to register keybind: ${error}`, 'error')
+      addLog(`[Keybind] Failed to register ${keybind}: ${error}`, 'error')
     }
   }
 
@@ -101,6 +102,7 @@ function App() {
   const unregisterSoundKeybind = async (keybind: string) => {
     try {
       await invoke('unregister_sound_keybind', { keybind })
+      addLog(`[Keybind] Unregistered: ${keybind}`, 'debug')
     } catch (error) {
       // Ignore errors when unregistering
     }
@@ -110,9 +112,9 @@ function App() {
   const registerStopAllKeybind = async (keybind: string) => {
     try {
       await invoke('register_stop_all_keybind', { keybind })
-      addLog(`Stop All keybind registered: ${keybind}`, 'success')
+      addLog(`[Keybind] Stop All registered: ${keybind}`, 'success')
     } catch (error) {
-      addLog(`Failed to register stop all keybind: ${error}`, 'error')
+      addLog(`[Keybind] Failed to register Stop All: ${error}`, 'error')
     }
   }
 
@@ -120,6 +122,7 @@ function App() {
   const unregisterStopAllKeybind = async (keybind: string) => {
     try {
       await invoke('unregister_stop_all_keybind', { keybind })
+      addLog(`[Keybind] Stop All unregistered`, 'debug')
     } catch (error) {
       // Ignore errors when unregistering
     }
@@ -165,10 +168,17 @@ function App() {
 
   // Check for updates
   const checkForUpdates = async () => {
+    let version = '1.0.0'
     try {
-      const version = await invoke<string>('get_current_version')
+      version = await invoke<string>('get_current_version')
       setCurrentVersion(version)
+      addLog(`[Update] Current version: v${version}`, 'debug')
+    } catch (error) {
+      addLog(`[Update] Failed to get version: ${error}`, 'error')
+    }
 
+    try {
+      addLog('[Update] Checking for updates...', 'debug')
       const updateInfo = await invoke<{
         available: boolean
         version?: string
@@ -178,15 +188,19 @@ function App() {
       if (updateInfo.available && updateInfo.version) {
         setUpdateStatus('update-available')
         setLatestVersion(updateInfo.version)
-        addLog(`Update available: v${updateInfo.version}`, 'info')
+        addLog(`[Update] New version available: v${updateInfo.version}`, 'warn')
+        if (updateInfo.notes) {
+          addLog(`[Update] Release notes: ${updateInfo.notes.split('\n')[0]}`, 'debug')
+        }
       } else {
         setUpdateStatus('up-to-date')
-        addLog(`MotoBoard v${version} - Up to date`, 'success')
+        addLog(`[Update] MotoBoard v${version} is up to date`, 'success')
       }
     } catch (error) {
-      // If update check fails (e.g., no internet, no releases yet), just show current version
+      // If update check fails, show the actual error for debugging
       setUpdateStatus('up-to-date')
-      addLog(`MotoBoard v${currentVersion || '1.0.0'}`, 'info')
+      addLog(`[Update] Check failed: ${error}`, 'warn')
+      addLog(`[Update] Running MotoBoard v${version}`, 'info')
     }
   }
 
@@ -194,26 +208,43 @@ function App() {
   const installUpdate = async () => {
     try {
       setIsUpdating(true)
-      addLog('Downloading update...', 'info')
+      addLog('[Update] Downloading update...', 'info')
       await invoke('install_update')
+      addLog('[Update] Download complete, restarting...', 'success')
       // App will restart automatically after install
     } catch (error) {
-      addLog(`Failed to install update: ${error}`, 'error')
+      addLog(`[Update] Failed to install update: ${error}`, 'error')
       setIsUpdating(false)
     }
   }
 
   // Load devices, sounds, and settings on mount
   useEffect(() => {
+    if (initializedRef.current) return
+    initializedRef.current = true
+
     const init = async () => {
-      addLog('MotoBoard initialized', 'success')
-      // Load settings first to get saved device preferences
+      addLog('═══════════════════════════════════════', 'info')
+      addLog('MotoBoard Starting...', 'success')
+      addLog('═══════════════════════════════════════', 'info')
+
+      // Load settings first
+      addLog('[Settings] Loading user preferences...', 'debug')
       const { hasSavedPrimaryDevice } = await loadSettings()
-      // Then load devices (auto-select only if no saved device)
+
+      // Load devices
       await loadDevices(!hasSavedPrimaryDevice)
-      loadSounds()
+
+      // Load sounds
+      await loadSounds()
+
       // Check for updates
-      checkForUpdates()
+      addLog('[Update] Checking for updates...', 'debug')
+      await checkForUpdates()
+
+      addLog('═══════════════════════════════════════', 'info')
+      addLog('MotoBoard Ready', 'success')
+      addLog('═══════════════════════════════════════', 'info')
     }
     init()
   }, [])
@@ -232,40 +263,52 @@ function App() {
 
       if (settings.primaryDevice) {
         setPrimaryDevice(settings.primaryDevice)
+        addLog(`[Settings] Primary device: ${settings.primaryDevice}`, 'debug')
       }
       if (settings.monitorDevice) {
         setMonitorDevice(settings.monitorDevice)
+        addLog(`[Settings] Monitor device: ${settings.monitorDevice}`, 'debug')
       }
       if (settings.masterVolume !== undefined) {
         setMasterVolume(Math.round(settings.masterVolume * 100))
+        addLog(`[Settings] Master volume: ${Math.round(settings.masterVolume * 100)}%`, 'debug')
       }
       if (settings.stopAllKeybind) {
         setStopAllKeybind(settings.stopAllKeybind)
-        addLog(`Loaded Stop All keybind: ${settings.stopAllKeybind}`, 'info')
+        addLog(`[Settings] Stop All keybind: ${settings.stopAllKeybind}`, 'debug')
       }
       if (settings.compactMode !== undefined) {
         setCompactMode(settings.compactMode)
+        addLog(`[Settings] Compact mode: ${settings.compactMode ? 'enabled' : 'disabled'}`, 'debug')
       }
       if (settings.theme) {
         setTheme(settings.theme)
+        addLog(`[Settings] Theme: ${settings.theme}`, 'debug')
       }
       if (settings.minimizeToTray !== undefined) {
         setMinimizeToTray(settings.minimizeToTray)
+        addLog(`[Settings] Minimize to tray: ${settings.minimizeToTray ? 'enabled' : 'disabled'}`, 'debug')
       }
 
+      addLog('[Settings] User preferences loaded', 'success')
       return { hasSavedPrimaryDevice: !!settings.primaryDevice }
     } catch (error) {
-      addLog(`Failed to load settings: ${error}`, 'error')
+      addLog(`[Settings] Failed to load: ${error}`, 'error')
       return { hasSavedPrimaryDevice: false }
     }
   }
 
   const loadDevices = async (autoSelectIfNoSaved: boolean = true) => {
     try {
-      addLog('Loading audio devices...')
+      addLog('[Audio] Scanning for audio devices...', 'debug')
       const deviceList = await invoke<AudioDevice[]>('get_audio_devices')
       setDevices(deviceList)
-      addLog(`Found ${deviceList.length} audio devices`, 'success')
+      addLog(`[Audio] Found ${deviceList.length} output devices`, 'success')
+
+      // Log each device
+      deviceList.forEach((device, index) => {
+        addLog(`[Audio]   ${index + 1}. ${device.name}`, 'debug')
+      })
 
       // Only auto-select VB-Cable if no device was saved
       if (autoSelectIfNoSaved) {
@@ -273,23 +316,33 @@ function App() {
         if (vbCable) {
           setPrimaryDevice(vbCable.name)
           await invoke('set_primary_device', { deviceName: vbCable.name })
-          addLog(`Auto-selected VB-Cable: ${vbCable.name}`, 'success')
+          addLog(`[Audio] Auto-selected: ${vbCable.name}`, 'success')
+        } else {
+          addLog('[Audio] VB-Cable not found - please select output device', 'warn')
         }
       }
     } catch (error) {
-      addLog(`Failed to load devices: ${error}`, 'error')
+      addLog(`[Audio] Failed to load devices: ${error}`, 'error')
     }
   }
 
   const loadSounds = async () => {
     try {
+      addLog('[Sounds] Loading sound library...', 'debug')
       const soundList = await invoke<Sound[]>('get_sounds')
       setSounds(soundList)
       if (soundList.length > 0) {
-        addLog(`Loaded ${soundList.length} sounds`, 'success')
+        addLog(`[Sounds] Loaded ${soundList.length} sounds`, 'success')
+        // Log sounds with keybinds
+        const withKeybinds = soundList.filter(s => s.keybind)
+        if (withKeybinds.length > 0) {
+          addLog(`[Sounds] ${withKeybinds.length} sounds have keybinds assigned`, 'debug')
+        }
+      } else {
+        addLog('[Sounds] No sounds loaded - click "Add Sound" to get started', 'info')
       }
     } catch (error) {
-      addLog(`Failed to load sounds: ${error}`, 'error')
+      addLog(`[Sounds] Failed to load: ${error}`, 'error')
     }
   }
 
@@ -298,14 +351,14 @@ function App() {
     try {
       // If overlap mode is disabled, stop all sounds first
       if (!overlapMode) {
+        addLog('[Playback] Stopping previous sounds (overlap disabled)', 'debug')
         await invoke('stop_all')
       }
 
       setPlayingSound(soundId)
-      addLog(`Playing: ${sound?.name || soundId}`)
+      addLog(`[Playback] Playing: ${sound?.name || soundId}`, 'info')
       await invoke('play_sound', { soundId })
       setStatus(`Playing: ${sound?.name}`)
-      addLog(`✓ Started playback: ${sound?.name}`, 'success')
 
       setTimeout(() => {
         setPlayingSound(null)
@@ -319,19 +372,19 @@ function App() {
 
   const stopAllSounds = async () => {
     try {
-      addLog('Stopping all sounds...')
+      addLog('[Playback] Stop All triggered', 'info')
       await invoke('stop_all')
       setPlayingSound(null)
       setStatus('Stopped all sounds')
-      addLog('✓ All sounds stopped', 'success')
+      addLog('[Playback] All sounds stopped', 'success')
     } catch (error) {
-      addLog(`✗ Failed to stop sounds: ${error}`, 'error')
+      addLog(`[Playback] Failed to stop sounds: ${error}`, 'error')
     }
   }
 
   const addSound = async () => {
     try {
-      addLog('Opening file dialog...')
+      addLog('[Sounds] Opening file dialog...', 'debug')
       const selected = await open({
         multiple: true,
         filters: [{
@@ -342,54 +395,73 @@ function App() {
 
       if (selected) {
         const files = Array.isArray(selected) ? selected : [selected]
+        addLog(`[Sounds] ${files.length} file(s) selected`, 'info')
         for (const filePath of files) {
-          addLog(`Adding: ${filePath}`)
+          const fileName = filePath.split(/[/\\]/).pop() || filePath
+          addLog(`[Sounds] Importing: ${fileName}`, 'debug')
           const sound = await invoke<Sound>('add_sound_from_path', { filePath })
-          addLog(`✓ Added sound: ${sound.name}`, 'success')
+          addLog(`[Sounds] Added: ${sound.name}`, 'success')
         }
         loadSounds()
       } else {
-        addLog('File selection cancelled')
+        addLog('[Sounds] File selection cancelled', 'debug')
       }
     } catch (error) {
-      addLog(`✗ Failed to add sound: ${error}`, 'error')
+      addLog(`[Sounds] Failed to add sound: ${error}`, 'error')
     }
   }
 
   const removeSound = async (soundId: string) => {
+    const sound = sounds.find(s => s.id === soundId)
     try {
+      addLog(`[Sounds] Removing: ${sound?.name || soundId}`, 'debug')
       await invoke('remove_sound', { soundId })
-      addLog('✓ Sound removed', 'success')
+      addLog(`[Sounds] Removed: ${sound?.name || soundId}`, 'success')
       setEditingSound(null)
       loadSounds()
     } catch (error) {
-      addLog(`✗ Failed to remove sound: ${error}`, 'error')
+      addLog(`[Sounds] Failed to remove: ${error}`, 'error')
     }
   }
 
   const updateSoundKeybind = async (soundId: string, keybind: string | null) => {
+    const sound = sounds.find(s => s.id === soundId)
     try {
       await invoke('update_sound_keybind', { soundId, keybind })
-      addLog(`✓ Keybind updated`, 'success')
+      if (keybind) {
+        addLog(`[Keybind] Set ${sound?.name || soundId} → ${keybind}`, 'success')
+      } else {
+        addLog(`[Keybind] Cleared keybind for ${sound?.name || soundId}`, 'info')
+      }
       loadSounds()
     } catch (error) {
-      addLog(`✗ Failed to update keybind: ${error}`, 'error')
+      addLog(`[Keybind] Failed to update: ${error}`, 'error')
     }
   }
 
   const saveEditingSound = async () => {
     if (!editingSound) return
     try {
+      addLog(`[Sounds] Saving settings for: ${editingSound.name}`, 'debug')
       await updateSoundKeybind(editingSound.id, editingSound.keybind)
-      await invoke('update_sound_trim', {
-        soundId: editingSound.id,
-        startTime: editingSound.startTime || null,
-        endTime: editingSound.endTime || null
-      })
-      addLog(`✓ Sound settings saved`, 'success')
+      if (editingSound.startTime || editingSound.endTime) {
+        await invoke('update_sound_trim', {
+          soundId: editingSound.id,
+          startTime: editingSound.startTime || null,
+          endTime: editingSound.endTime || null
+        })
+        addLog(`[Sounds] Trim set: ${(editingSound.startTime || 0).toFixed(1)}s - ${(editingSound.endTime || audioDuration).toFixed(1)}s`, 'debug')
+      } else {
+        await invoke('update_sound_trim', {
+          soundId: editingSound.id,
+          startTime: null,
+          endTime: null
+        })
+      }
+      addLog(`[Sounds] Settings saved for: ${editingSound.name}`, 'success')
       loadSounds()
     } catch (error) {
-      addLog(`✗ Failed to save sound: ${error}`, 'error')
+      addLog(`[Sounds] Failed to save settings: ${error}`, 'error')
     }
     setEditingSound(null)
   }
@@ -397,11 +469,13 @@ function App() {
   // Load and process audio for waveform visualization
   const loadWaveform = async (filePath: string) => {
     try {
+      addLog('[Audio] Generating waveform...', 'debug')
       const audioData = await readBinaryFile(filePath)
       const audioContext = new AudioContext()
       const audioBuffer = await audioContext.decodeAudioData(audioData.buffer as ArrayBuffer)
 
       setAudioDuration(audioBuffer.duration)
+      addLog(`[Audio] Duration: ${audioBuffer.duration.toFixed(2)}s, Sample rate: ${audioBuffer.sampleRate}Hz`, 'debug')
 
       // Get the audio channel data
       const channelData = audioBuffer.getChannelData(0)
@@ -424,7 +498,7 @@ function App() {
 
       audioContext.close()
     } catch (error) {
-      addLog(`Failed to load waveform: ${error}`, 'error')
+      addLog(`[Audio] Failed to load waveform: ${error}`, 'error')
       setWaveformData([])
     }
   }
@@ -516,9 +590,9 @@ function App() {
       })
 
       await audio.play()
-      addLog(`Preview: ${startTime.toFixed(1)}s - ${endTime.toFixed(1)}s`, 'info')
+      addLog(`[Preview] Playing: ${startTime.toFixed(1)}s - ${endTime.toFixed(1)}s`, 'info')
     } catch (error) {
-      addLog(`Failed to preview: ${error}`, 'error')
+      addLog(`[Preview] Failed to play: ${error}`, 'error')
       setIsPreviewPlaying(false)
     }
   }
@@ -539,23 +613,25 @@ function App() {
   }, [editingSound])
 
   const handlePrimaryDeviceChange = async (deviceName: string) => {
+    addLog(`[Audio] Changing primary output...`, 'debug')
     setPrimaryDevice(deviceName)
     try {
       await invoke('set_primary_device', { deviceName })
       setStatus(`Primary device: ${deviceName}`)
-      addLog(`Primary device set: ${deviceName}`, 'success')
+      addLog(`[Audio] Primary output: ${deviceName}`, 'success')
     } catch (error) {
-      addLog(`✗ Failed to set primary device: ${error}`, 'error')
+      addLog(`[Audio] Failed to set primary device: ${error}`, 'error')
     }
   }
 
   const handleMonitorDeviceChange = async (deviceName: string) => {
+    addLog(`[Audio] Changing monitor output...`, 'debug')
     setMonitorDevice(deviceName)
     try {
       await invoke('set_monitor_device', { deviceName })
-      addLog(`Monitor device set: ${deviceName || 'None'}`, 'success')
+      addLog(`[Audio] Monitor output: ${deviceName || 'None (disabled)'}`, 'success')
     } catch (error) {
-      addLog(`✗ Failed to set monitor device: ${error}`, 'error')
+      addLog(`[Audio] Failed to set monitor device: ${error}`, 'error')
     }
   }
 
@@ -563,8 +639,9 @@ function App() {
     setMasterVolume(volume)
     try {
       await invoke('set_master_volume', { volume: volume / 100 })
+      // Only log on significant changes to avoid spam
     } catch (error) {
-      addLog(`✗ Failed to set volume: ${error}`, 'error')
+      addLog(`[Audio] Failed to set volume: ${error}`, 'error')
     }
   }
 
@@ -572,9 +649,9 @@ function App() {
     setCompactMode(enabled)
     try {
       await invoke('set_compact_mode', { enabled })
-      addLog(`Compact mode ${enabled ? 'enabled' : 'disabled'}`, 'success')
+      addLog(`[UI] Compact mode: ${enabled ? 'enabled' : 'disabled'}`, 'success')
     } catch (error) {
-      addLog(`✗ Failed to set compact mode: ${error}`, 'error')
+      addLog(`[UI] Failed to set compact mode: ${error}`, 'error')
     }
   }
 
@@ -582,9 +659,9 @@ function App() {
     setTheme(newTheme)
     try {
       await invoke('set_theme', { theme: newTheme })
-      addLog(`Theme changed to ${newTheme}`, 'success')
+      addLog(`[UI] Theme changed: ${newTheme}`, 'success')
     } catch (error) {
-      addLog(`✗ Failed to set theme: ${error}`, 'error')
+      addLog(`[UI] Failed to set theme: ${error}`, 'error')
     }
   }
 
@@ -592,9 +669,9 @@ function App() {
     setMinimizeToTray(enabled)
     try {
       await invoke('set_minimize_to_tray', { enabled })
-      addLog(`Minimize to tray ${enabled ? 'enabled' : 'disabled'}`, 'success')
+      addLog(`[UI] Minimize to tray: ${enabled ? 'enabled' : 'disabled'}`, 'success')
     } catch (error) {
-      addLog(`✗ Failed to set minimize to tray: ${error}`, 'error')
+      addLog(`[UI] Failed to set minimize to tray: ${error}`, 'error')
     }
   }
 
@@ -654,9 +731,9 @@ function App() {
     try {
       const soundIds = newSounds.map(s => s.id)
       await invoke('update_sound_order', { soundIds })
-      addLog('Sound order updated', 'success')
+      addLog('[Sounds] Sound order updated', 'success')
     } catch (error) {
-      addLog(`Failed to update order: ${error}`, 'error')
+      addLog(`[Sounds] Failed to update order: ${error}`, 'error')
       loadSounds()
     }
 
@@ -875,7 +952,7 @@ function App() {
                           await unregisterStopAllKeybind(stopAllKeybind)
                           setStopAllKeybind('')
                           await invoke('set_stop_all_keybind', { keybind: null })
-                          addLog('Stop All keybind cleared', 'info')
+                          addLog('[Keybind] Stop All keybind cleared', 'info')
                         }}
                       >
                         X
@@ -1046,7 +1123,7 @@ function App() {
                         onClick={async () => {
                           await unregisterSoundKeybind(editingSound.keybind!)
                           setEditingSound({ ...editingSound, keybind: null })
-                          addLog('Keybind cleared', 'info')
+                          addLog(`[Keybind] Cleared keybind for: ${editingSound.name}`, 'info')
                         }}
                       >
                         X

@@ -651,6 +651,15 @@ body {
   color: var(--neon-red);
 }
 
+.console-line.warn {
+  color: #ffaa00;
+}
+
+.console-line.debug {
+  color: #888;
+  font-style: italic;
+}
+
 .console-line .timestamp {
   color: #555;
   margin-right: 8px;

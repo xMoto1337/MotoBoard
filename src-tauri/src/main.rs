@@ -689,8 +689,13 @@ struct UpdateInfo {
 async fn check_for_updates(app_handle: AppHandle) -> Result<UpdateInfo, String> {
     use tauri::updater::builder;
 
+    println!("[Updater] Checking for updates... Current version: {}", VERSION);
+
     match builder(app_handle).check().await {
         Ok(update) => {
+            println!("[Updater] Latest version from server: {}", update.latest_version());
+            println!("[Updater] Update available: {}", update.is_update_available());
+
             if update.is_update_available() {
                 Ok(UpdateInfo {
                     available: true,
@@ -706,7 +711,7 @@ async fn check_for_updates(app_handle: AppHandle) -> Result<UpdateInfo, String> 
             }
         }
         Err(e) => {
-            // If we can't check for updates, just report no update available
+            println!("[Updater] Error checking updates: {}", e);
             Err(format!("Failed to check for updates: {}", e))
         }
     }
