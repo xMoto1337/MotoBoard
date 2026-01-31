@@ -7,7 +7,12 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri:clean": "cd src-tauri && cargo clean",
+    "tauri:dev:clean": "npm run tauri:clean && npm run tauri:dev",
+    "tauri:build:clean": "npm run tauri:clean && npm run tauri:build"
   },
   "dependencies": {
     "react": "^18.2.0",

@@ -1,6 +1,9 @@
 // Prevents additional console window on Windows in release AND debug
 #![windows_subsystem = "windows"]
 
+// Include generated version from build.rs
+include!(concat!(env!("OUT_DIR"), "/version.rs"));
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -672,7 +675,7 @@ fn unregister_stop_all_keybind(app_handle: AppHandle, keybind: String) -> Result
 
 #[tauri::command]
 fn get_current_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    VERSION.to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]

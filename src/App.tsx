@@ -604,51 +604,32 @@ function App() {
     document.documentElement.setAttribute('data-compact', String(compactMode))
   }, [theme, compactMode])
 
-  // Drag and drop handlers
-  const handleDragStart = (e: React.DragEvent, soundId: string) => {
-    e.stopPropagation()
-    setDraggedSound(soundId)
-    e.dataTransfer.effectAllowed = 'move'
-    e.dataTransfer.setData('text/plain', soundId)
-
-    // Add a slight delay for visual feedback
-    setTimeout(() => {
-      const card = document.querySelector(`[data-sound-id="${soundId}"]`) as HTMLElement
-      if (card) {
-        card.classList.add('dragging')
-      }
-    }, 0)
-  }
-
-  const handleDragEnd = (e: React.DragEvent) => {
-    e.stopPropagation()
-    // Remove dragging class from all cards
-    document.querySelectorAll('.sound-card.dragging').forEach(el => {
-      el.classList.remove('dragging')
-    })
-    setDraggedSound(null)
-    setDragOverSound(null)
-  }
-
-  const handleDragOver = (e: React.DragEvent, soundId: string) => {
+  // Drag and drop using mouse events (more reliable than HTML5 drag API in WebView)
+  const handleMouseDown = (e: React.MouseEvent, soundId: string) => {
+    if (e.button !== 0) return
+    const target = e.target as HTMLElement
+    if (target.closest('.sound-edit-btn')) return
     e.preventDefault()
-    e.stopPropagation()
-    e.dataTransfer.dropEffect = 'move'
-    if (draggedSound && soundId !== draggedSound) {
+    setDraggedSound(soundId)
+  }
+
+  const handleMouseEnter = (soundId: string) => {
+    if (draggedSound && draggedSound !== soundId) {
       setDragOverSound(soundId)
     }
   }
 
-  const handleDragLeave = (e: React.DragEvent) => {
-    e.stopPropagation()
-    setDragOverSound(null)
+  const handleMouseLeave = () => {
+    if (draggedSound) {
+      setDragOverSound(null)
+    }
   }
 
-  const handleDrop = async (e: React.DragEvent, targetSoundId: string) => {
-    e.preventDefault()
+  const handleMouseUp = async (e: React.MouseEvent, soundId: string) => {
+    if (!draggedSound) return
     e.stopPropagation()
 
-    if (!draggedSound || draggedSound === targetSoundId) {
+    if (draggedSound === soundId) {
       setDraggedSound(null)
       setDragOverSound(null)
       return
@@ -656,31 +637,44 @@ function App() {
 
     // Reorder sounds
     const draggedIndex = sounds.findIndex(s => s.id === draggedSound)
-    const targetIndex = sounds.findIndex(s => s.id === targetSoundId)
+    const targetIndex = sounds.findIndex(s => s.id === soundId)
 
-    if (draggedIndex === -1 || targetIndex === -1) return
+    if (draggedIndex === -1 || targetIndex === -1) {
+      setDraggedSound(null)
+      setDragOverSound(null)
+      return
+    }
 
     const newSounds = [...sounds]
     const [removed] = newSounds.splice(draggedIndex, 1)
     newSounds.splice(targetIndex, 0, removed)
 
-    // Update local state immediately
     setSounds(newSounds)
 
-    // Save new order to backend
     try {
       const soundIds = newSounds.map(s => s.id)
       await invoke('update_sound_order', { soundIds })
       addLog('Sound order updated', 'success')
     } catch (error) {
       addLog(`Failed to update order: ${error}`, 'error')
-      // Reload sounds on error
       loadSounds()
     }
 
     setDraggedSound(null)
     setDragOverSound(null)
   }
+
+  // Cancel drag if mouse up outside any card
+  useEffect(() => {
+    const handleGlobalMouseUp = () => {
+      if (draggedSound) {
+        setDraggedSound(null)
+        setDragOverSound(null)
+      }
+    }
+    window.addEventListener('mouseup', handleGlobalMouseUp)
+    return () => window.removeEventListener('mouseup', handleGlobalMouseUp)
+  }, [draggedSound])
 
   return (
     <>
@@ -730,23 +724,15 @@ function App() {
           {sounds.map((sound) => (
             <div
               key={sound.id}
-              data-sound-id={sound.id}
               className={`sound-card ${draggedSound === sound.id ? 'dragging' : ''} ${dragOverSound === sound.id ? 'drag-over' : ''}`}
-              draggable={true}
-              onDragStart={(e) => handleDragStart(e, sound.id)}
-              onDragEnd={(e) => handleDragEnd(e)}
-              onDragOver={(e) => handleDragOver(e, sound.id)}
-              onDragLeave={(e) => handleDragLeave(e)}
-              onDrop={(e) => handleDrop(e, sound.id)}
+              onMouseDown={(e) => handleMouseDown(e, sound.id)}
+              onMouseEnter={() => handleMouseEnter(sound.id)}
+              onMouseLeave={handleMouseLeave}
+              onMouseUp={(e) => handleMouseUp(e, sound.id)}
             >
               <button
                 className={`sound-btn ${playingSound === sound.id ? 'playing' : ''}`}
-                onClick={(e) => {
-                  e.stopPropagation()
-                  playSound(sound.id)
-                }}
-                onMouseDown={(e) => e.stopPropagation()}
-                draggable={false}
+                onClick={() => playSound(sound.id)}
               >
                 <span className="sound-btn-name">{sound.name}</span>
                 {sound.keybind && (
@@ -759,9 +745,7 @@ function App() {
                   e.stopPropagation()
                   setEditingSound(sound)
                 }}
-                onMouseDown={(e) => e.stopPropagation()}
                 title="Edit sound"
-                draggable={false}
               >
                 ⚙
               </button>

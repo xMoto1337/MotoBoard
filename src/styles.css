@@ -1131,64 +1131,36 @@ body {
 .theme-option[data-theme="pink"] .theme-color { background: #ff00aa; }
 
 /* ===== DRAG AND DROP ===== */
-
-/* Drag indicator that appears on hover */
-.sound-card::before {
-  content: '⋮⋮';
-  position: absolute;
-  top: 50%;
-  left: 4px;
-  transform: translateY(-50%);
-  font-size: 10px;
-  letter-spacing: -3px;
-  color: var(--text-secondary);
-  opacity: 0;
-  transition: opacity 0.2s ease;
-  z-index: 5;
-  pointer-events: none;
-}
-
-.sound-card:hover::before {
-  opacity: 0.5;
-}
-
 .sound-card.dragging {
   opacity: 0.4;
-  transform: scale(0.95) !important;
-  cursor: grabbing !important;
-  z-index: 100;
-}
-
-.sound-card.dragging .sound-btn,
-.sound-card.dragging .sound-edit-btn {
-  pointer-events: none;
-}
-
-.sound-card.dragging::before {
-  opacity: 0;
+  transform: scale(0.92);
+  filter: brightness(0.7);
 }
 
 .sound-card.drag-over {
-  transform: scale(1.02);
+  transform: scale(1.03);
 }
 
-.sound-card.drag-over::after {
-  content: '';
-  position: absolute;
-  inset: -4px;
-  border: 2px dashed var(--neon-primary);
-  border-radius: 14px;
-  pointer-events: none;
-  animation: drag-pulse 0.8s ease-in-out infinite;
-  z-index: 10;
-  box-shadow: 0 0 15px color-mix(in srgb, var(--neon-primary) 40%, transparent);
+.sound-card.drag-over .sound-btn {
+  border-color: var(--neon-primary);
+  box-shadow:
+    0 0 15px var(--neon-primary),
+    0 0 30px color-mix(in srgb, var(--neon-primary) 40%, transparent),
+    inset 0 0 20px color-mix(in srgb, var(--neon-primary) 15%, transparent);
+  animation: drop-target-pulse 0.8s ease-in-out infinite;
 }
 
-@keyframes drag-pulse {
+@keyframes drop-target-pulse {
   0%, 100% {
-    opacity: 0.5;
+    box-shadow:
+      0 0 15px var(--neon-primary),
+      0 0 30px color-mix(in srgb, var(--neon-primary) 40%, transparent),
+      inset 0 0 20px color-mix(in srgb, var(--neon-primary) 15%, transparent);
   }
   50% {
-    opacity: 1;
+    box-shadow:
+      0 0 25px var(--neon-primary),
+      0 0 50px color-mix(in srgb, var(--neon-primary) 60%, transparent),
+      inset 0 0 30px color-mix(in srgb, var(--neon-primary) 25%, transparent);
   }
 }
