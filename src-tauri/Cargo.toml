@@ -1,6 +1,6 @@
 [package]
 name = "motoboard"
-version = "1.0.10"
+version = "1.0.11"
 description = "A gaming soundboard with neon glow UI"
 authors = ["MotoBoard"]
 edition = "2021"

@@ -58,10 +58,62 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app
-        run: npm run tauri build -- --verbose
+        run: |
+          Write-Host "Building with signing enabled..."
+          Write-Host "Key length: $($env:TAURI_PRIVATE_KEY.Length)"
+          npm run tauri build
+        shell: pwsh
         env:
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+      - name: Sign the installer manually
+        run: |
+          $keyPath = "signing-key.txt"
+          $env:TAURI_PRIVATE_KEY | Out-File -FilePath $keyPath -Encoding utf8 -NoNewline
+
+          $exePath = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" | Select-Object -First 1
+          Write-Host "Found exe: $($exePath.FullName)"
+
+          # Use tauri signer to sign
+          npx tauri signer sign --private-key-path $keyPath --password $env:TAURI_KEY_PASSWORD "$($exePath.FullName)"
+
+          Remove-Item $keyPath -Force
+        shell: pwsh
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+      - name: Generate latest.json
+        run: |
+          $exePath = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" | Select-Object -First 1
+          $sigPath = "$($exePath.FullName).sig"
+
+          if (Test-Path $sigPath) {
+            $signature = Get-Content $sigPath -Raw
+            $version = "${{ github.ref_name }}".TrimStart('v')
+            $url = "https://github.com/xMoto1337/MotoBoard/releases/download/${{ github.ref_name }}/$($exePath.Name)"
+
+            $json = @{
+              version = $version
+              notes = "See release notes on GitHub"
+              pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+              platforms = @{
+                "windows-x86_64" = @{
+                  signature = $signature.Trim()
+                  url = $url
+                }
+              }
+            } | ConvertTo-Json -Depth 10
+
+            $json | Out-File -FilePath "src-tauri/target/release/bundle/nsis/latest.json" -Encoding utf8
+            Write-Host "Created latest.json"
+            Get-Content "src-tauri/target/release/bundle/nsis/latest.json"
+          } else {
+            Write-Host "ERROR: Signature file not found at $sigPath"
+            exit 1
+          }
+        shell: pwsh
 
       - name: List build artifacts
         run: |
