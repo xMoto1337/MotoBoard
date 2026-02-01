@@ -259,6 +259,7 @@ function App() {
         compactMode?: boolean
         theme?: string
         minimizeToTray?: boolean
+        overlapMode?: boolean
       }>('get_settings')
 
       if (settings.primaryDevice) {
@@ -288,6 +289,10 @@ function App() {
       if (settings.minimizeToTray !== undefined) {
         setMinimizeToTray(settings.minimizeToTray)
         addLog(`[Settings] Minimize to tray: ${settings.minimizeToTray ? 'enabled' : 'disabled'}`, 'debug')
+      }
+      if (settings.overlapMode !== undefined) {
+        setOverlapMode(settings.overlapMode)
+        addLog(`[Settings] Overlap mode: ${settings.overlapMode ? 'enabled' : 'disabled'}`, 'debug')
       }
 
       addLog('[Settings] User preferences loaded', 'success')
@@ -675,6 +680,16 @@ function App() {
     }
   }
 
+  const handleOverlapModeChange = async (enabled: boolean) => {
+    setOverlapMode(enabled)
+    try {
+      await invoke('set_overlap_mode', { enabled })
+      addLog(`[Playback] Overlap mode: ${enabled ? 'enabled' : 'disabled'}`, 'success')
+    } catch (error) {
+      addLog(`[Playback] Failed to set overlap mode: ${error}`, 'error')
+    }
+  }
+
   // Apply theme and compact mode to document
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -971,7 +986,7 @@ function App() {
                     <input
                       type="checkbox"
                       checked={overlapMode}
-                      onChange={(e) => setOverlapMode(e.target.checked)}
+                      onChange={(e) => handleOverlapModeChange(e.target.checked)}
                     />
                     <span>Allow sound overlap</span>
                   </label>

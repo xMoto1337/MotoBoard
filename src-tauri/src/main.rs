@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use tauri::{State, Manager, AppHandle, GlobalShortcutManager, api::process::restart, SystemTray, SystemTrayMenu, SystemTrayMenuItem, CustomMenuItem, SystemTrayEvent};
 use uuid::Uuid;
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source, source::SineWave};
 use rdev::{listen, Event, EventType, Key};
 
 // Global stop flag for all playing sounds
@@ -20,6 +20,11 @@ static STOP_ALL_FLAG: AtomicBool = AtomicBool::new(false);
 
 // Global app handle for playing sounds from shortcuts
 static APP_HANDLE: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+// Debounce tracking to prevent double triggers from both keybind systems
+lazy_static::lazy_static! {
+    static ref LAST_TRIGGER_TIME: Mutex<HashMap<String, std::time::Instant>> = Mutex::new(HashMap::new());
+}
 
 // Global keybind registry for low-level keyboard hook
 // Maps keybind string (e.g., "Ctrl+A") to sound ID (or "STOP_ALL" for stop all)
@@ -292,7 +297,7 @@ struct PersistentSettings {
     primary_device: Option<String>,
     #[serde(rename = "monitorDevice")]
     monitor_device: Option<String>,
-    #[serde(rename = "masterVolume")]
+    #[serde(rename = "masterVolume", default = "default_volume")]
     master_volume: f32,
     #[serde(rename = "stopAllKeybind")]
     stop_all_keybind: Option<String>,
@@ -302,6 +307,16 @@ struct PersistentSettings {
     theme: String,
     #[serde(rename = "minimizeToTray", default)]
     minimize_to_tray: bool,
+    #[serde(rename = "overlapMode", default = "default_overlap")]
+    overlap_mode: bool,
+}
+
+fn default_volume() -> f32 {
+    0.8
+}
+
+fn default_overlap() -> bool {
+    true
 }
 
 fn default_theme() -> String {
@@ -324,6 +339,7 @@ fn save_settings(state: &AudioState) {
             compact_mode: state.compact_mode,
             theme: state.theme.clone(),
             minimize_to_tray: state.minimize_to_tray,
+            overlap_mode: state.overlap_mode,
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             if let Ok(mut file) = File::create(&settings_file) {
@@ -383,6 +399,8 @@ struct Settings {
     theme: String,
     #[serde(rename = "minimizeToTray")]
     minimize_to_tray: bool,
+    #[serde(rename = "overlapMode")]
+    overlap_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -400,6 +418,7 @@ struct AudioState {
     compact_mode: bool,
     theme: String,
     minimize_to_tray: bool,
+    overlap_mode: bool,
 }
 
 impl Default for AudioState {
@@ -413,6 +432,7 @@ impl Default for AudioState {
             compact_mode: false,
             theme: "green".to_string(),
             minimize_to_tray: false,
+            overlap_mode: true,
         }
     }
 }
@@ -488,6 +508,7 @@ fn get_settings(state: State<AppState>) -> Settings {
         compact_mode: audio_state.compact_mode,
         theme: audio_state.theme.clone(),
         minimize_to_tray: audio_state.minimize_to_tray,
+        overlap_mode: audio_state.overlap_mode,
     }
 }
 
@@ -519,6 +540,14 @@ fn set_theme(theme: String, state: State<AppState>) -> Result<(), String> {
 fn set_minimize_to_tray(enabled: bool, state: State<AppState>) -> Result<(), String> {
     let mut audio_state = state.lock().map_err(|e| e.to_string())?;
     audio_state.minimize_to_tray = enabled;
+    save_settings(&audio_state);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_overlap_mode(enabled: bool, state: State<AppState>) -> Result<(), String> {
+    let mut audio_state = state.lock().map_err(|e| e.to_string())?;
+    audio_state.overlap_mode = enabled;
     save_settings(&audio_state);
     Ok(())
 }
@@ -609,6 +638,37 @@ fn update_sound_order(sound_ids: Vec<String>, state: State<AppState>) -> Result<
     }
     save_sounds(&audio_state.sounds);
     Ok(())
+}
+
+// Warm up audio device by playing a very short silent tone
+// This initializes the audio pipeline and prevents first-play issues
+fn warmup_audio_device(device_name: Option<&str>) {
+    std::thread::spawn({
+        let device = device_name.map(|s| s.to_string());
+        move || {
+            let (_stream, stream_handle): (OutputStream, OutputStreamHandle) = if let Some(ref name) = device {
+                if let Some(dev) = find_device_by_name(name) {
+                    match OutputStream::try_from_device(&dev) {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    }
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            };
+
+            if let Ok(sink) = Sink::try_new(&stream_handle) {
+                // Play a very short, very quiet sine wave to initialize the device
+                let source = SineWave::new(440.0)
+                    .take_duration(std::time::Duration::from_millis(50))
+                    .amplify(0.001); // Nearly silent
+                sink.append(source);
+                sink.sleep_until_end();
+            }
+        }
+    });
 }
 
 fn find_device_by_name(name: &str) -> Option<rodio::cpal::Device> {
@@ -772,6 +832,22 @@ fn convert_keybind_to_accelerator(keybind: &str) -> String {
 
 // Play sound by ID using the global app handle
 fn play_sound_by_id(sound_id: String) {
+    // Debounce: prevent double triggers within 150ms (from both GlobalShortcutManager and rdev)
+    {
+        let now = std::time::Instant::now();
+        let mut last_triggers = match LAST_TRIGGER_TIME.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+
+        if let Some(last_time) = last_triggers.get(&sound_id) {
+            if now.duration_since(*last_time).as_millis() < 150 {
+                return; // Skip duplicate trigger
+            }
+        }
+        last_triggers.insert(sound_id.clone(), now);
+    }
+
     if let Some(app_handle) = APP_HANDLE.get() {
         let state: State<AppState> = app_handle.state();
         let audio_state = match state.lock() {
@@ -794,8 +870,15 @@ fn play_sound_by_id(sound_id: String) {
         let volume = audio_state.master_volume * sound.volume;
         let start_time = sound.start_time;
         let end_time = sound.end_time;
+        let overlap_mode = audio_state.overlap_mode;
 
         drop(audio_state);
+
+        // If overlap mode is disabled, stop all sounds first
+        if !overlap_mode {
+            STOP_ALL_FLAG.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
 
         // Reset stop flag if needed
         if STOP_ALL_FLAG.load(Ordering::SeqCst) {
@@ -806,16 +889,25 @@ fn play_sound_by_id(sound_id: String) {
         // Play to primary device
         let file_path_primary = file_path.clone();
         let primary = primary_device.clone();
-        std::thread::spawn(move || {
-            let _ = play_on_device(&file_path_primary, primary.as_deref(), volume, start_time, end_time);
-        });
+        std::thread::Builder::new()
+            .name("sound_player".to_string())
+            .spawn(move || {
+                // Small delay to ensure audio device is ready (helps with game audio conflicts)
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let _ = play_on_device(&file_path_primary, primary.as_deref(), volume, start_time, end_time);
+            })
+            .ok();
 
         // Play to monitor device
         if let Some(monitor) = monitor_device {
             if primary_device.as_ref() != Some(&monitor) {
-                std::thread::spawn(move || {
-                    let _ = play_on_device(&file_path, Some(&monitor), volume, start_time, end_time);
-                });
+                std::thread::Builder::new()
+                    .name("monitor_player".to_string())
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        let _ = play_on_device(&file_path, Some(&monitor), volume, start_time, end_time);
+                    })
+                    .ok();
             }
         }
     }
@@ -991,6 +1083,7 @@ fn main() {
             initial_state.compact_mode = settings.compact_mode;
             initial_state.theme = settings.theme;
             initial_state.minimize_to_tray = settings.minimize_to_tray;
+            initial_state.overlap_mode = settings.overlap_mode;
         }
     }
 
@@ -1008,6 +1101,9 @@ fn main() {
 
     // Clone minimize_to_tray for use in window close handler
     let minimize_to_tray_setting = initial_state.minimize_to_tray;
+
+    // Clone primary device for audio warmup
+    let primary_device_for_warmup = initial_state.primary_device.clone();
 
     let audio_state: AppState = Arc::new(Mutex::new(initial_state));
     let audio_state_for_tray = audio_state.clone();
@@ -1092,6 +1188,7 @@ fn main() {
             set_compact_mode,
             set_theme,
             set_minimize_to_tray,
+            set_overlap_mode,
             get_current_version,
             check_for_updates,
             install_update,
@@ -1101,6 +1198,11 @@ fn main() {
         .setup(move |app| {
             // Store app handle globally for use in shortcut callbacks
             let _ = APP_HANDLE.set(app.handle());
+
+            // Warm up audio device (helps with games that use exclusive audio)
+            if let Some(ref device) = primary_device_for_warmup {
+                warmup_audio_device(Some(device));
+            }
 
             // Start the low-level keyboard listener (for games without anti-cheat)
             start_keyboard_listener();
