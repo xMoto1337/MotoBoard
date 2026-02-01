@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-use tauri::{State, Manager, AppHandle, api::process::restart, SystemTray, SystemTrayMenu, SystemTrayMenuItem, CustomMenuItem, SystemTrayEvent};
+use tauri::{State, Manager, AppHandle, GlobalShortcutManager, api::process::restart, SystemTray, SystemTrayMenu, SystemTrayMenuItem, CustomMenuItem, SystemTrayEvent};
 use uuid::Uuid;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use rdev::{listen, Event, EventType, Key};
@@ -191,6 +191,11 @@ fn normalize_keybind(keybind: &str) -> String {
     parts.join("+")
 }
 
+// Track last detected key for debugging
+lazy_static::lazy_static! {
+    static ref LAST_KEY_PRESS: Mutex<Option<String>> = Mutex::new(None);
+}
+
 // Start the low-level keyboard listener in a background thread
 fn start_keyboard_listener() {
     std::thread::spawn(move || {
@@ -198,15 +203,17 @@ fn start_keyboard_listener() {
             match event.event_type {
                 EventType::KeyPress(key) => {
                     if let Some(key_str) = key_to_string(key) {
+                        // Track last key for debugging
+                        if let Ok(mut last) = LAST_KEY_PRESS.lock() {
+                            *last = Some(key_str.clone());
+                        }
+
                         let mut pressed = PRESSED_KEYS.lock().unwrap();
-                        let was_empty = pressed.is_empty();
                         pressed.insert(key_str);
                         drop(pressed);
 
-                        // Only check for match when a new key is added
-                        if !was_empty || PRESSED_KEYS.lock().unwrap().len() == 1 {
-                            check_keybind_match();
-                        }
+                        // Always check for match on every key press
+                        check_keybind_match();
                     }
                 }
                 EventType::KeyRelease(key) => {
@@ -744,6 +751,25 @@ fn stop_all() -> Result<(), String> {
     Ok(())
 }
 
+// Convert frontend keybind format to Tauri accelerator format
+fn convert_keybind_to_accelerator(keybind: &str) -> String {
+    keybind
+        .replace("CONTROL", "Ctrl")
+        .replace("SHIFT", "Shift")
+        .replace("ALT", "Alt")
+        .replace("META", "Super")
+        .replace("SPACE", "Space")
+        .replace("ARROWUP", "Up")
+        .replace("ARROWDOWN", "Down")
+        .replace("ARROWLEFT", "Left")
+        .replace("ARROWRIGHT", "Right")
+        .replace("ESCAPE", "Escape")
+        .replace("ENTER", "Return")
+        .replace("BACKSPACE", "Backspace")
+        .replace("DELETE", "Delete")
+        .replace("TAB", "Tab")
+}
+
 // Play sound by ID using the global app handle
 fn play_sound_by_id(sound_id: String) {
     if let Some(app_handle) = APP_HANDLE.get() {
@@ -796,48 +822,95 @@ fn play_sound_by_id(sound_id: String) {
 }
 
 #[tauri::command]
-fn register_sound_keybind(_app_handle: AppHandle, sound_id: String, keybind: String) -> Result<(), String> {
-    let mut registry = KEYBIND_REGISTRY.lock().map_err(|e| e.to_string())?;
+fn register_sound_keybind(app_handle: AppHandle, sound_id: String, keybind: String) -> Result<(), String> {
+    // Register with rdev low-level listener (for games without anti-cheat)
+    {
+        let mut registry = KEYBIND_REGISTRY.lock().map_err(|e| e.to_string())?;
+        registry.retain(|_, v| v != &sound_id);
+        registry.insert(keybind.clone(), sound_id.clone());
+    }
 
-    // Remove any existing binding for this sound
-    registry.retain(|_, v| v != &sound_id);
+    // Also register with Tauri GlobalShortcutManager (reliable for normal apps)
+    let accelerator = convert_keybind_to_accelerator(&keybind);
+    let mut shortcut_manager = app_handle.global_shortcut_manager();
+    let _ = shortcut_manager.unregister(&accelerator); // Ignore error if not registered
 
-    // Add the new binding
-    registry.insert(keybind.clone(), sound_id);
-
-    Ok(())
-}
-
-#[tauri::command]
-fn unregister_sound_keybind(_app_handle: AppHandle, keybind: String) -> Result<(), String> {
-    let mut registry = KEYBIND_REGISTRY.lock().map_err(|e| e.to_string())?;
-    registry.remove(&keybind);
-    Ok(())
-}
-
-#[tauri::command]
-fn register_stop_all_keybind(_app_handle: AppHandle, keybind: String) -> Result<(), String> {
-    let mut registry = KEYBIND_REGISTRY.lock().map_err(|e| e.to_string())?;
-
-    // Remove any existing stop all binding
-    registry.retain(|_, v| v != "STOP_ALL");
-
-    // Add the new binding
-    registry.insert(keybind, "STOP_ALL".to_string());
+    let id = sound_id.clone();
+    let _ = shortcut_manager.register(&accelerator, move || {
+        play_sound_by_id(id.clone());
+    });
 
     Ok(())
 }
 
 #[tauri::command]
-fn unregister_stop_all_keybind(_app_handle: AppHandle, keybind: String) -> Result<(), String> {
-    let mut registry = KEYBIND_REGISTRY.lock().map_err(|e| e.to_string())?;
-    registry.remove(&keybind);
+fn unregister_sound_keybind(app_handle: AppHandle, keybind: String) -> Result<(), String> {
+    // Unregister from rdev
+    {
+        let mut registry = KEYBIND_REGISTRY.lock().map_err(|e| e.to_string())?;
+        registry.remove(&keybind);
+    }
+
+    // Unregister from GlobalShortcutManager
+    let accelerator = convert_keybind_to_accelerator(&keybind);
+    let mut shortcut_manager = app_handle.global_shortcut_manager();
+    let _ = shortcut_manager.unregister(&accelerator);
+
+    Ok(())
+}
+
+#[tauri::command]
+fn register_stop_all_keybind(app_handle: AppHandle, keybind: String) -> Result<(), String> {
+    // Register with rdev
+    {
+        let mut registry = KEYBIND_REGISTRY.lock().map_err(|e| e.to_string())?;
+        registry.retain(|_, v| v != "STOP_ALL");
+        registry.insert(keybind.clone(), "STOP_ALL".to_string());
+    }
+
+    // Also register with GlobalShortcutManager
+    let accelerator = convert_keybind_to_accelerator(&keybind);
+    let mut shortcut_manager = app_handle.global_shortcut_manager();
+    let _ = shortcut_manager.unregister(&accelerator);
+
+    let _ = shortcut_manager.register(&accelerator, || {
+        STOP_ALL_FLAG.store(true, Ordering::SeqCst);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn unregister_stop_all_keybind(app_handle: AppHandle, keybind: String) -> Result<(), String> {
+    // Unregister from rdev
+    {
+        let mut registry = KEYBIND_REGISTRY.lock().map_err(|e| e.to_string())?;
+        registry.remove(&keybind);
+    }
+
+    // Unregister from GlobalShortcutManager
+    let accelerator = convert_keybind_to_accelerator(&keybind);
+    let mut shortcut_manager = app_handle.global_shortcut_manager();
+    let _ = shortcut_manager.unregister(&accelerator);
+
     Ok(())
 }
 
 #[tauri::command]
 fn get_current_version() -> String {
     VERSION.to_string()
+}
+
+#[tauri::command]
+fn get_last_key_press() -> Option<String> {
+    LAST_KEY_PRESS.lock().ok().and_then(|guard| guard.clone())
+}
+
+#[tauri::command]
+fn get_registered_keybinds() -> Vec<String> {
+    KEYBIND_REGISTRY.lock()
+        .map(|guard| guard.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1022,24 +1095,44 @@ fn main() {
             get_current_version,
             check_for_updates,
             install_update,
+            get_last_key_press,
+            get_registered_keybinds,
         ])
         .setup(move |app| {
             // Store app handle globally for use in shortcut callbacks
             let _ = APP_HANDLE.set(app.handle());
 
-            // Start the low-level keyboard listener
+            // Start the low-level keyboard listener (for games without anti-cheat)
             start_keyboard_listener();
 
-            // Register existing keybinds from loaded sounds
+            // Register existing keybinds with BOTH systems
+            let mut shortcut_manager = app.global_shortcut_manager();
+
+            // Register sound keybinds
             {
                 let mut registry = KEYBIND_REGISTRY.lock().unwrap();
                 for (sound_id, keybind) in sounds_for_keybinds {
-                    registry.insert(keybind, sound_id);
+                    // Add to rdev registry
+                    registry.insert(keybind.clone(), sound_id.clone());
+
+                    // Add to GlobalShortcutManager
+                    let accelerator = convert_keybind_to_accelerator(&keybind);
+                    let id = sound_id.clone();
+                    let _ = shortcut_manager.register(&accelerator, move || {
+                        play_sound_by_id(id.clone());
+                    });
                 }
 
                 // Register stop all keybind if saved
                 if let Some(keybind) = stop_all_keybind_for_register {
-                    registry.insert(keybind, "STOP_ALL".to_string());
+                    // Add to rdev registry
+                    registry.insert(keybind.clone(), "STOP_ALL".to_string());
+
+                    // Add to GlobalShortcutManager
+                    let accelerator = convert_keybind_to_accelerator(&keybind);
+                    let _ = shortcut_manager.register(&accelerator, || {
+                        STOP_ALL_FLAG.store(true, Ordering::SeqCst);
+                    });
                 }
             }
 
