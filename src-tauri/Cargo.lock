@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "motoboard"
-version = "1.2.1"
+version = "1.2.3"
 dependencies = [
  "dirs",
  "lazy_static",

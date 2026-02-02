@@ -12,6 +12,13 @@ interface Sound {
   startTime?: number
   endTime?: number
   order: number
+  loopMode?: boolean
+  playbackSpeed?: number
+  echoDelay?: number
+  echoVolume?: number
+  reverbDecay?: number
+  bassBoost?: number
+  fakeBassBoost?: number
 }
 
 interface AudioDevice {
@@ -40,6 +47,7 @@ function App() {
   const [stopAllKeybind, setStopAllKeybind] = useState<string>('')
   const [recordingKeybind, setRecordingKeybind] = useState<'sound' | 'stopAll' | null>(null)
   const [overlapMode, setOverlapMode] = useState(true)
+  const [crossfadeDuration, setCrossfadeDuration] = useState(0)
   const [defaultVolume, setDefaultVolume] = useState(80)
   const [fadeInDuration, setFadeInDuration] = useState(0)
   const [fadeOutDuration, setFadeOutDuration] = useState(0)
@@ -56,6 +64,8 @@ function App() {
   const [isUpdating, setIsUpdating] = useState(false)
   const [draggedSound, setDraggedSound] = useState<string | null>(null)
   const [dragOverSound, setDragOverSound] = useState<string | null>(null)
+  const [soundQueue, setSoundQueue] = useState<string[]>([])
+  const [isQueuePlaying, setIsQueuePlaying] = useState(false)
   const consoleRef = useRef<HTMLDivElement>(null)
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null)
   const previewAudioRef = useRef<HTMLAudioElement | null>(null)
@@ -260,6 +270,7 @@ function App() {
         theme?: string
         minimizeToTray?: boolean
         overlapMode?: boolean
+        crossfadeDuration?: number
       }>('get_settings')
 
       if (settings.primaryDevice) {
@@ -293,6 +304,10 @@ function App() {
       if (settings.overlapMode !== undefined) {
         setOverlapMode(settings.overlapMode)
         addLog(`[Settings] Overlap mode: ${settings.overlapMode ? 'enabled' : 'disabled'}`, 'debug')
+      }
+      if (settings.crossfadeDuration !== undefined) {
+        setCrossfadeDuration(settings.crossfadeDuration)
+        addLog(`[Settings] Crossfade duration: ${settings.crossfadeDuration}ms`, 'debug')
       }
 
       addLog('[Settings] User preferences loaded', 'success')
@@ -380,10 +395,63 @@ function App() {
       addLog('[Playback] Stop All triggered', 'info')
       await invoke('stop_all')
       setPlayingSound(null)
+      setIsQueuePlaying(false)
+      setSoundQueue([])
       setStatus('Stopped all sounds')
       addLog('[Playback] All sounds stopped', 'success')
     } catch (error) {
       addLog(`[Playback] Failed to stop sounds: ${error}`, 'error')
+    }
+  }
+
+  const addToQueue = async (soundId: string) => {
+    try {
+      const sound = sounds.find(s => s.id === soundId)
+      const queue = await invoke<string[]>('add_to_queue', { soundId })
+      setSoundQueue(queue)
+      addLog(`[Queue] Added "${sound?.name}" to queue (${queue.length} in queue)`, 'info')
+      setStatus(`Added to queue: ${sound?.name}`)
+    } catch (error) {
+      addLog(`[Queue] Failed to add to queue: ${error}`, 'error')
+    }
+  }
+
+  const clearQueue = async () => {
+    try {
+      await invoke('clear_queue')
+      setSoundQueue([])
+      setIsQueuePlaying(false)
+      addLog('[Queue] Queue cleared', 'info')
+      setStatus('Queue cleared')
+    } catch (error) {
+      addLog(`[Queue] Failed to clear queue: ${error}`, 'error')
+    }
+  }
+
+  const playQueue = async () => {
+    if (soundQueue.length === 0) {
+      addLog('[Queue] Queue is empty', 'warn')
+      return
+    }
+    try {
+      setIsQueuePlaying(true)
+      addLog(`[Queue] Playing queue (${soundQueue.length} sounds)`, 'info')
+      setStatus('Playing queue...')
+      await invoke('play_queue')
+      // Poll for queue completion
+      const checkQueue = setInterval(async () => {
+        const playing = await invoke<boolean>('is_queue_playing')
+        if (!playing) {
+          setIsQueuePlaying(false)
+          setSoundQueue([])
+          setStatus('Ready')
+          addLog('[Queue] Queue finished', 'success')
+          clearInterval(checkQueue)
+        }
+      }, 500)
+    } catch (error) {
+      setIsQueuePlaying(false)
+      addLog(`[Queue] Failed to play queue: ${error}`, 'error')
     }
   }
 
@@ -449,6 +517,21 @@ function App() {
     try {
       addLog(`[Sounds] Saving settings for: ${editingSound.name}`, 'debug')
       await updateSoundKeybind(editingSound.id, editingSound.keybind)
+
+      // Save volume, loop mode, and audio effects
+      await invoke('update_sound_settings', {
+        soundId: editingSound.id,
+        volume: editingSound.volume,
+        loopMode: editingSound.loopMode || false,
+        playbackSpeed: editingSound.playbackSpeed || 1.0,
+        echoDelay: editingSound.echoDelay || 0,
+        echoVolume: editingSound.echoVolume || 0,
+        reverbDecay: editingSound.reverbDecay || 0,
+        bassBoost: editingSound.bassBoost || 0,
+        fakeBassBoost: editingSound.fakeBassBoost || 0
+      })
+
+      // Save trim settings
       if (editingSound.startTime || editingSound.endTime) {
         await invoke('update_sound_trim', {
           soundId: editingSound.id,
@@ -690,6 +773,16 @@ function App() {
     }
   }
 
+  const handleCrossfadeDurationChange = async (duration: number) => {
+    setCrossfadeDuration(duration)
+    try {
+      await invoke('set_crossfade_duration', { duration })
+      addLog(`[Playback] Crossfade duration: ${duration}ms`, 'success')
+    } catch (error) {
+      addLog(`[Playback] Failed to set crossfade duration: ${error}`, 'error')
+    }
+  }
+
   // Apply theme and compact mode to document
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -803,6 +896,20 @@ function App() {
           <button className="btn btn-danger" onClick={stopAllSounds}>
             Stop All {stopAllKeybind && <span className="btn-keybind">[{stopAllKeybind}]</span>}
           </button>
+          {soundQueue.length > 0 && (
+            <div className="queue-controls">
+              <button
+                className={`btn btn-queue ${isQueuePlaying ? 'playing' : ''}`}
+                onClick={playQueue}
+                disabled={isQueuePlaying}
+              >
+                {isQueuePlaying ? 'Playing...' : `Play Queue (${soundQueue.length})`}
+              </button>
+              <button className="btn btn-secondary" onClick={clearQueue} disabled={isQueuePlaying}>
+                Clear
+              </button>
+            </div>
+          )}
           <button className="btn btn-primary" onClick={() => setShowSettings(true)}>
             Settings
           </button>
@@ -830,6 +937,16 @@ function App() {
                 {sound.keybind && (
                   <span className="sound-btn-keybind">{sound.keybind}</span>
                 )}
+              </button>
+              <button
+                className="sound-queue-btn"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  addToQueue(sound.id)
+                }}
+                title="Add to queue"
+              >
+                +
               </button>
               <button
                 className="sound-edit-btn"
@@ -992,6 +1109,19 @@ function App() {
                   </label>
                   <p className="settings-hint">Play multiple sounds at once</p>
                 </div>
+                <div className="settings-item">
+                  <label>Queue Crossfade: {crossfadeDuration}ms</label>
+                  <input
+                    type="range"
+                    min="0"
+                    max="2000"
+                    step="100"
+                    value={crossfadeDuration}
+                    onChange={(e) => handleCrossfadeDurationChange(parseInt(e.target.value))}
+                    className="settings-slider"
+                  />
+                  <p className="settings-hint">Fade between sounds in queue mode (0 = off)</p>
+                </div>
               </div>
 
               {/* Audio */}
@@ -1144,6 +1274,193 @@ function App() {
                         X
                       </button>
                     )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="settings-section">
+                <h3>Volume</h3>
+                <div className="settings-item">
+                  <div className="volume-container">
+                    <input
+                      type="range"
+                      className="volume-slider"
+                      min="0"
+                      max="200"
+                      value={Math.round(editingSound.volume * 100)}
+                      onChange={(e) => setEditingSound({
+                        ...editingSound,
+                        volume: parseInt(e.target.value) / 100
+                      })}
+                    />
+                    <span className="volume-value">{Math.round(editingSound.volume * 100)}%</span>
+                  </div>
+                  <p className="settings-hint">Individual volume (0-200%, relative to master)</p>
+                </div>
+              </div>
+
+              <div className="settings-section">
+                <h3>Playback</h3>
+                <div className="settings-item">
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={editingSound.loopMode || false}
+                      onChange={(e) => setEditingSound({
+                        ...editingSound,
+                        loopMode: e.target.checked
+                      })}
+                    />
+                    <span>Loop Mode</span>
+                  </label>
+                  <p className="settings-hint">Repeat sound until stopped</p>
+                </div>
+              </div>
+
+              <div className="settings-section">
+                <h3>Audio Effects</h3>
+
+                {/* Speed Control */}
+                <div className="effect-group">
+                  <div className="effect-group-header">Speed</div>
+                  <div className="settings-item">
+                    <label>Playback Speed: {((editingSound.playbackSpeed || 1) * 100).toFixed(0)}%</label>
+                    <div className="volume-container">
+                      <input
+                        type="range"
+                        className="volume-slider"
+                        min="25"
+                        max="200"
+                        step="5"
+                        value={Math.round((editingSound.playbackSpeed || 1) * 100)}
+                        onChange={(e) => setEditingSound({
+                          ...editingSound,
+                          playbackSpeed: parseInt(e.target.value) / 100
+                        })}
+                      />
+                      <button
+                        className="reset-btn"
+                        onClick={() => setEditingSound({ ...editingSound, playbackSpeed: 1.0 })}
+                        title="Reset to 100%"
+                      >
+                        ↺
+                      </button>
+                    </div>
+                    <p className="settings-hint">Slower = lower pitch, Faster = higher pitch</p>
+                  </div>
+                </div>
+
+                {/* Echo & Reverb */}
+                <div className="effect-group">
+                  <div className="effect-group-header">Echo & Reverb</div>
+                  <div className="settings-item">
+                    <label>Echo Delay: {((editingSound.echoDelay || 0) * 1000).toFixed(0)}ms</label>
+                    <div className="volume-container">
+                      <input
+                        type="range"
+                        className="volume-slider"
+                        min="0"
+                        max="1000"
+                        step="50"
+                        value={Math.round((editingSound.echoDelay || 0) * 1000)}
+                        onChange={(e) => setEditingSound({
+                          ...editingSound,
+                          echoDelay: parseInt(e.target.value) / 1000
+                        })}
+                      />
+                      <button
+                        className="reset-btn"
+                        onClick={() => setEditingSound({ ...editingSound, echoDelay: 0, echoVolume: 0, reverbDecay: 0 })}
+                        title="Reset Echo"
+                      >
+                        ↺
+                      </button>
+                    </div>
+                    <p className="settings-hint">Time between original and echo (0 = off)</p>
+                  </div>
+                  <div className="settings-item">
+                    <label>Echo Volume: {Math.round((editingSound.echoVolume || 0) * 100)}%</label>
+                    <div className="volume-container">
+                      <input
+                        type="range"
+                        className="volume-slider"
+                        min="0"
+                        max="100"
+                        step="5"
+                        value={Math.round((editingSound.echoVolume || 0) * 100)}
+                        onChange={(e) => setEditingSound({
+                          ...editingSound,
+                          echoVolume: parseInt(e.target.value) / 100
+                        })}
+                      />
+                    </div>
+                    <p className="settings-hint">How loud the echo is</p>
+                  </div>
+                  <div className="settings-item">
+                    <label>Reverb: {Math.round((editingSound.reverbDecay || 0) * 100)}%</label>
+                    <div className="volume-container">
+                      <input
+                        type="range"
+                        className="volume-slider"
+                        min="0"
+                        max="90"
+                        step="10"
+                        value={Math.round((editingSound.reverbDecay || 0) * 100)}
+                        onChange={(e) => setEditingSound({
+                          ...editingSound,
+                          reverbDecay: parseInt(e.target.value) / 100
+                        })}
+                      />
+                    </div>
+                    <p className="settings-hint">Multiple fading echoes for room/hall effect</p>
+                  </div>
+                </div>
+
+                {/* Bass Effects */}
+                <div className="effect-group">
+                  <div className="effect-group-header">Bass</div>
+                  <div className="settings-item">
+                    <label>Bass Boost: {Math.round((editingSound.bassBoost || 0) * 100)}%</label>
+                    <div className="volume-container">
+                      <input
+                        type="range"
+                        className="volume-slider"
+                        min="0"
+                        max="300"
+                        step="25"
+                        value={Math.round((editingSound.bassBoost || 0) * 100)}
+                        onChange={(e) => setEditingSound({
+                          ...editingSound,
+                          bassBoost: parseInt(e.target.value) / 100
+                        })}
+                      />
+                      <button
+                        className="reset-btn"
+                        onClick={() => setEditingSound({ ...editingSound, bassBoost: 0, fakeBassBoost: 0 })}
+                        title="Reset Bass"
+                      >
+                        ↺
+                      </button>
+                    </div>
+                    <p className="settings-hint">Adds low frequency layer on top of audio</p>
+                  </div>
+                  <div className="settings-item">
+                    <label>Extreme Bass: {Math.round((editingSound.fakeBassBoost || 0) * 100)}%</label>
+                    <div className="volume-container">
+                      <input
+                        type="range"
+                        className="volume-slider"
+                        min="0"
+                        max="1000"
+                        step="50"
+                        value={Math.round((editingSound.fakeBassBoost || 0) * 100)}
+                        onChange={(e) => setEditingSound({
+                          ...editingSound,
+                          fakeBassBoost: parseInt(e.target.value) / 100
+                        })}
+                      />
+                    </div>
+                    <p className="settings-hint">Replaces audio entirely (disables other effects)</p>
                   </div>
                 </div>
               </div>

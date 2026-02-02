@@ -33,6 +33,12 @@ lazy_static::lazy_static! {
     static ref PRESSED_KEYS: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
 }
 
+// Sound queue for sequential playback
+lazy_static::lazy_static! {
+    static ref SOUND_QUEUE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+}
+static QUEUE_PLAYING: AtomicBool = AtomicBool::new(false);
+
 // Convert rdev Key to string representation
 fn key_to_string(key: Key) -> Option<String> {
     match key {
@@ -309,6 +315,8 @@ struct PersistentSettings {
     minimize_to_tray: bool,
     #[serde(rename = "overlapMode", default = "default_overlap")]
     overlap_mode: bool,
+    #[serde(rename = "crossfadeDuration", default)]
+    crossfade_duration: u32,
 }
 
 fn default_volume() -> f32 {
@@ -340,6 +348,7 @@ fn save_settings(state: &AudioState) {
             theme: state.theme.clone(),
             minimize_to_tray: state.minimize_to_tray,
             overlap_mode: state.overlap_mode,
+            crossfade_duration: state.crossfade_duration,
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             if let Ok(mut file) = File::create(&settings_file) {
@@ -382,6 +391,24 @@ struct Sound {
     end_time: Option<f64>,
     #[serde(default)]
     order: i32,
+    #[serde(rename = "loopMode", default)]
+    loop_mode: bool,
+    #[serde(rename = "playbackSpeed", default = "default_speed")]
+    playback_speed: f32,
+    #[serde(rename = "echoDelay", default)]
+    echo_delay: f32,
+    #[serde(rename = "echoVolume", default)]
+    echo_volume: f32,
+    #[serde(rename = "reverbDecay", default)]
+    reverb_decay: f32,
+    #[serde(rename = "bassBoost", default)]
+    bass_boost: f32,
+    #[serde(rename = "fakeBassBoost", default)]
+    fake_bass_boost: f32,
+}
+
+fn default_speed() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,6 +428,8 @@ struct Settings {
     minimize_to_tray: bool,
     #[serde(rename = "overlapMode")]
     overlap_mode: bool,
+    #[serde(rename = "crossfadeDuration")]
+    crossfade_duration: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -419,6 +448,7 @@ struct AudioState {
     theme: String,
     minimize_to_tray: bool,
     overlap_mode: bool,
+    crossfade_duration: u32,
 }
 
 impl Default for AudioState {
@@ -433,6 +463,7 @@ impl Default for AudioState {
             theme: "green".to_string(),
             minimize_to_tray: false,
             overlap_mode: true,
+            crossfade_duration: 0,
         }
     }
 }
@@ -509,6 +540,7 @@ fn get_settings(state: State<AppState>) -> Settings {
         theme: audio_state.theme.clone(),
         minimize_to_tray: audio_state.minimize_to_tray,
         overlap_mode: audio_state.overlap_mode,
+        crossfade_duration: audio_state.crossfade_duration,
     }
 }
 
@@ -553,6 +585,14 @@ fn set_overlap_mode(enabled: bool, state: State<AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
+fn set_crossfade_duration(duration: u32, state: State<AppState>) -> Result<(), String> {
+    let mut audio_state = state.lock().map_err(|e| e.to_string())?;
+    audio_state.crossfade_duration = duration;
+    save_settings(&audio_state);
+    Ok(())
+}
+
+#[tauri::command]
 fn add_sound_from_path(file_path: String, state: State<AppState>) -> Result<Sound, String> {
     let path = PathBuf::from(&file_path);
 
@@ -581,6 +621,13 @@ fn add_sound_from_path(file_path: String, state: State<AppState>) -> Result<Soun
         start_time: None,
         end_time: None,
         order,
+        loop_mode: false,
+        playback_speed: 1.0,
+        echo_delay: 0.0,
+        echo_volume: 0.0,
+        reverb_decay: 0.0,
+        bass_boost: 0.0,
+        fake_bass_boost: 0.0,
     };
 
     let mut audio_state = state.lock().map_err(|e| e.to_string())?;
@@ -623,6 +670,34 @@ fn update_sound_trim(
     if let Some(sound) = audio_state.sounds.get_mut(&sound_id) {
         sound.start_time = start_time;
         sound.end_time = end_time;
+    }
+    save_sounds(&audio_state.sounds);
+    Ok(())
+}
+
+#[tauri::command]
+fn update_sound_settings(
+    sound_id: String,
+    volume: f32,
+    loop_mode: bool,
+    playback_speed: f32,
+    echo_delay: f32,
+    echo_volume: f32,
+    reverb_decay: f32,
+    bass_boost: f32,
+    fake_bass_boost: f32,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let mut audio_state = state.lock().map_err(|e| e.to_string())?;
+    if let Some(sound) = audio_state.sounds.get_mut(&sound_id) {
+        sound.volume = volume.clamp(0.0, 2.0); // Allow up to 200%
+        sound.loop_mode = loop_mode;
+        sound.playback_speed = playback_speed.clamp(0.25, 2.0); // 0.25x to 2x speed
+        sound.echo_delay = echo_delay.clamp(0.0, 1.0); // 0 to 1 second delay
+        sound.echo_volume = echo_volume.clamp(0.0, 1.0); // Echo volume 0-100%
+        sound.reverb_decay = reverb_decay.clamp(0.0, 0.9); // Reverb decay 0-90%
+        sound.bass_boost = bass_boost.clamp(0.0, 3.0); // Bass boost 0-300%
+        sound.fake_bass_boost = fake_bass_boost.clamp(0.0, 10.0); // Fake bass boost 0-1000% (extreme!)
     }
     save_sounds(&audio_state.sounds);
     Ok(())
@@ -690,6 +765,8 @@ fn play_on_device(
     volume: f32,
     start_time: Option<f64>,
     end_time: Option<f64>,
+    loop_mode: bool,
+    playback_speed: f32,
 ) -> Result<(), String> {
     let file = File::open(file_path).map_err(|e| format!("Failed to open file: {}", e))?;
     let source = Decoder::new(BufReader::new(file))
@@ -715,8 +792,20 @@ fn play_on_device(
 
     sink.set_volume(volume);
 
-    // Apply trim settings
+    // Apply trim settings and optional looping
     let start_secs = start_time.unwrap_or(0.0);
+    let speed = playback_speed.clamp(0.25, 2.0);
+
+    // Macro to apply speed effect
+    macro_rules! with_speed {
+        ($source:expr) => {
+            if (speed - 1.0).abs() > 0.01 {
+                $source.speed(speed)
+            } else {
+                $source.speed(1.0) // No-op but keeps type consistent
+            }
+        };
+    }
 
     if let Some(end_secs) = end_time {
         if start_secs > 0.0 {
@@ -725,22 +814,279 @@ fn play_on_device(
             let trimmed = source
                 .skip_duration(std::time::Duration::from_secs_f64(start_secs))
                 .take_duration(std::time::Duration::from_secs_f64(duration));
-            sink.append(trimmed);
+            if loop_mode {
+                // Buffer the source for looping (allows repeat without re-reading file)
+                sink.append(with_speed!(trimmed.buffered().repeat_infinite()));
+            } else {
+                sink.append(with_speed!(trimmed));
+            }
         } else {
             // Just take until end time
             let trimmed = source.take_duration(std::time::Duration::from_secs_f64(end_secs));
-            sink.append(trimmed);
+            if loop_mode {
+                sink.append(with_speed!(trimmed.buffered().repeat_infinite()));
+            } else {
+                sink.append(with_speed!(trimmed));
+            }
         }
     } else if start_secs > 0.0 {
         // Just skip to start time
         let trimmed = source.skip_duration(std::time::Duration::from_secs_f64(start_secs));
-        sink.append(trimmed);
+        if loop_mode {
+            sink.append(with_speed!(trimmed.buffered().repeat_infinite()));
+        } else {
+            sink.append(with_speed!(trimmed));
+        }
     } else {
         // No trimming
-        sink.append(source);
+        if loop_mode {
+            sink.append(with_speed!(source.buffered().repeat_infinite()));
+        } else {
+            sink.append(with_speed!(source));
+        }
     }
 
     // Poll for stop signal instead of blocking until end
+    while !sink.empty() {
+        if STOP_ALL_FLAG.load(Ordering::SeqCst) {
+            sink.stop();
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    Ok(())
+}
+
+// Play bass-boosted version using low-pass filter
+fn play_bass_boost(
+    file_path: &str,
+    device_name: Option<&str>,
+    volume: f32,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    playback_speed: f32,
+) -> Result<(), String> {
+    let file = File::open(file_path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let source = Decoder::new(BufReader::new(file))
+        .map_err(|e| format!("Failed to decode audio: {}", e))?
+        .convert_samples::<f32>(); // Convert to f32 for low_pass filter
+
+    let (_stream, stream_handle): (OutputStream, OutputStreamHandle) = if let Some(name) = device_name {
+        if let Some(device) = find_device_by_name(name) {
+            OutputStream::try_from_device(&device)
+                .map_err(|e| format!("Failed to open device: {}", e))?
+        } else {
+            OutputStream::try_default()
+                .map_err(|e| format!("Failed to open default device: {}", e))?
+        }
+    } else {
+        OutputStream::try_default()
+            .map_err(|e| format!("Failed to open default device: {}", e))?
+    };
+
+    let sink = Sink::try_new(&stream_handle)
+        .map_err(|e| format!("Failed to create sink: {}", e))?;
+
+    sink.set_volume(volume);
+
+    let start_secs = start_time.unwrap_or(0.0);
+    let speed = playback_speed.clamp(0.25, 2.0);
+
+    // Apply low-pass filter at 150Hz to isolate bass frequencies, then apply speed
+    macro_rules! with_bass_and_speed {
+        ($source:expr) => {{
+            let bass = $source.low_pass(150);
+            if (speed - 1.0).abs() > 0.01 {
+                bass.speed(speed)
+            } else {
+                bass.speed(1.0)
+            }
+        }};
+    }
+
+    if let Some(end_secs) = end_time {
+        if start_secs > 0.0 {
+            let duration = end_secs - start_secs;
+            let trimmed = source
+                .skip_duration(std::time::Duration::from_secs_f64(start_secs))
+                .take_duration(std::time::Duration::from_secs_f64(duration));
+            sink.append(with_bass_and_speed!(trimmed));
+        } else {
+            let trimmed = source.take_duration(std::time::Duration::from_secs_f64(end_secs));
+            sink.append(with_bass_and_speed!(trimmed));
+        }
+    } else if start_secs > 0.0 {
+        let trimmed = source.skip_duration(std::time::Duration::from_secs_f64(start_secs));
+        sink.append(with_bass_and_speed!(trimmed));
+    } else {
+        sink.append(with_bass_and_speed!(source));
+    }
+
+    // Poll for stop signal
+    while !sink.empty() {
+        if STOP_ALL_FLAG.load(Ordering::SeqCst) {
+            sink.stop();
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    Ok(())
+}
+
+// Play extreme bass version - heavily distorted bass effect
+// Stacked low-pass filters + high amplification, replaces original audio
+fn play_fake_bass_boost(
+    file_path: &str,
+    device_name: Option<&str>,
+    volume: f32,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    playback_speed: f32,
+) -> Result<(), String> {
+    let file = File::open(file_path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let source = Decoder::new(BufReader::new(file))
+        .map_err(|e| format!("Failed to decode audio: {}", e))?
+        .convert_samples::<f32>();
+
+    let (_stream, stream_handle): (OutputStream, OutputStreamHandle) = if let Some(name) = device_name {
+        if let Some(device) = find_device_by_name(name) {
+            OutputStream::try_from_device(&device)
+                .map_err(|e| format!("Failed to open device: {}", e))?
+        } else {
+            OutputStream::try_default()
+                .map_err(|e| format!("Failed to open default device: {}", e))?
+        }
+    } else {
+        OutputStream::try_default()
+            .map_err(|e| format!("Failed to open default device: {}", e))?
+    };
+
+    let sink = Sink::try_new(&stream_handle)
+        .map_err(|e| format!("Failed to create sink: {}", e))?;
+
+    sink.set_volume(volume);
+
+    let start_secs = start_time.unwrap_or(0.0);
+    // Slow it down slightly for that deep fried effect
+    let speed = (playback_speed * 0.85).clamp(0.2, 2.0);
+
+    // MAXIMUM BASS: Stack multiple low-pass filters + extreme amplification
+    // This creates the classic "earrape" distorted bass meme sound
+    macro_rules! with_fake_bass_and_speed {
+        ($source:expr) => {{
+            // Chain: low_pass(600) -> amplify 4x -> low_pass(300) -> amplify 4x
+            // Double filtering + double amplification = pure distorted bass destruction
+            let bass = $source
+                .low_pass(600)      // First pass: capture bass + low-mids
+                .amplify(4.0)       // Boost hard
+                .low_pass(300)      // Second pass: isolate the BASS
+                .amplify(4.0);      // BOOST HARDER (total 16x amplification)
+            bass.speed(speed)
+        }};
+    }
+
+    if let Some(end_secs) = end_time {
+        if start_secs > 0.0 {
+            let duration = end_secs - start_secs;
+            let trimmed = source
+                .skip_duration(std::time::Duration::from_secs_f64(start_secs))
+                .take_duration(std::time::Duration::from_secs_f64(duration));
+            sink.append(with_fake_bass_and_speed!(trimmed));
+        } else {
+            let trimmed = source.take_duration(std::time::Duration::from_secs_f64(end_secs));
+            sink.append(with_fake_bass_and_speed!(trimmed));
+        }
+    } else if start_secs > 0.0 {
+        let trimmed = source.skip_duration(std::time::Duration::from_secs_f64(start_secs));
+        sink.append(with_fake_bass_and_speed!(trimmed));
+    } else {
+        sink.append(with_fake_bass_and_speed!(source));
+    }
+
+    // Poll for stop signal
+    while !sink.empty() {
+        if STOP_ALL_FLAG.load(Ordering::SeqCst) {
+            sink.stop();
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    Ok(())
+}
+
+// Version with optional fade-in for crossfade support in queue mode
+fn play_on_device_with_fade(
+    file_path: &str,
+    device_name: Option<&str>,
+    volume: f32,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    fade_duration: Option<std::time::Duration>,
+    playback_speed: f32,
+) -> Result<(), String> {
+    let file = File::open(file_path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let source = Decoder::new(BufReader::new(file))
+        .map_err(|e| format!("Failed to decode audio: {}", e))?;
+
+    let (_stream, stream_handle): (OutputStream, OutputStreamHandle) = if let Some(name) = device_name {
+        if let Some(device) = find_device_by_name(name) {
+            OutputStream::try_from_device(&device)
+                .map_err(|e| format!("Failed to open device: {}", e))?
+        } else {
+            OutputStream::try_default()
+                .map_err(|e| format!("Failed to open default device: {}", e))?
+        }
+    } else {
+        OutputStream::try_default()
+            .map_err(|e| format!("Failed to open default device: {}", e))?
+    };
+
+    let sink = Sink::try_new(&stream_handle)
+        .map_err(|e| format!("Failed to create sink: {}", e))?;
+
+    sink.set_volume(volume);
+
+    let start_secs = start_time.unwrap_or(0.0);
+    let speed = playback_speed.clamp(0.25, 2.0);
+
+    // Helper macro to apply fade_in and speed if needed
+    macro_rules! append_with_effects {
+        ($source:expr) => {{
+            let with_speed = if (speed - 1.0).abs() > 0.01 {
+                $source.speed(speed)
+            } else {
+                $source.speed(1.0)
+            };
+            if let Some(fade) = fade_duration {
+                sink.append(with_speed.fade_in(fade));
+            } else {
+                sink.append(with_speed);
+            }
+        }};
+    }
+
+    if let Some(end_secs) = end_time {
+        if start_secs > 0.0 {
+            let duration = end_secs - start_secs;
+            let trimmed = source
+                .skip_duration(std::time::Duration::from_secs_f64(start_secs))
+                .take_duration(std::time::Duration::from_secs_f64(duration));
+            append_with_effects!(trimmed);
+        } else {
+            let trimmed = source.take_duration(std::time::Duration::from_secs_f64(end_secs));
+            append_with_effects!(trimmed);
+        }
+    } else if start_secs > 0.0 {
+        let trimmed = source.skip_duration(std::time::Duration::from_secs_f64(start_secs));
+        append_with_effects!(trimmed);
+    } else {
+        append_with_effects!(source);
+    }
+
+    // Poll for stop signal
     while !sink.empty() {
         if STOP_ALL_FLAG.load(Ordering::SeqCst) {
             sink.stop();
@@ -772,6 +1118,13 @@ fn play_sound(sound_id: String, state: State<AppState>) -> Result<(), String> {
     let volume = audio_state.master_volume * sound.volume;
     let start_time = sound.start_time;
     let end_time = sound.end_time;
+    let loop_mode = sound.loop_mode;
+    let playback_speed = sound.playback_speed;
+    let echo_delay = sound.echo_delay;
+    let echo_volume = sound.echo_volume;
+    let reverb_decay = sound.reverb_decay;
+    let bass_boost = sound.bass_boost;
+    let fake_bass_boost = sound.fake_bass_boost;
 
     // Drop the lock before spawning threads
     drop(audio_state);
@@ -782,22 +1135,129 @@ fn play_sound(sound_id: String, state: State<AppState>) -> Result<(), String> {
         STOP_ALL_FLAG.store(false, Ordering::SeqCst);
     }
 
-    // Play to primary device in a thread
+    // If extreme bass is enabled, play that INSTEAD of everything else (exclusive mode)
+    if fake_bass_boost > 0.0 {
+        // Play extreme bass version on primary device
+        let file_path_extreme = file_path.clone();
+        let primary_extreme = primary_device.clone();
+        let extreme_vol = volume * fake_bass_boost;
+        std::thread::spawn(move || {
+            let _ = play_fake_bass_boost(&file_path_extreme, primary_extreme.as_deref(), extreme_vol, start_time, end_time, playback_speed);
+        });
+
+        // Play extreme bass on monitor device too
+        if let Some(ref monitor) = monitor_device {
+            if primary_device.as_ref() != Some(monitor) {
+                let file_path_extreme = file_path;
+                let monitor_extreme = monitor.clone();
+                let extreme_vol = volume * fake_bass_boost;
+                std::thread::spawn(move || {
+                    let _ = play_fake_bass_boost(&file_path_extreme, Some(&monitor_extreme), extreme_vol, start_time, end_time, playback_speed);
+                });
+            }
+        }
+
+        // Extreme bass is exclusive - skip all other effects
+        return Ok(());
+    }
+
+    // Play normal sound to primary device
     let file_path_primary = file_path.clone();
     let primary = primary_device.clone();
     let start_primary = start_time;
     let end_primary = end_time;
     std::thread::spawn(move || {
-        let _ = play_on_device(&file_path_primary, primary.as_deref(), volume, start_primary, end_primary);
+        let _ = play_on_device(&file_path_primary, primary.as_deref(), volume, start_primary, end_primary, loop_mode, playback_speed);
     });
 
-    // Play to monitor device in a thread (if set and different from primary)
-    if let Some(monitor) = monitor_device {
-        if primary_device.as_ref() != Some(&monitor) {
-            let file_path_monitor = file_path;
+    // Play echo/reverb on primary device (delayed playback at lower volume)
+    // If reverb_decay > 0, create multiple echoes with decaying volume
+    if echo_delay > 0.0 && echo_volume > 0.0 {
+        let num_echoes = if reverb_decay > 0.0 { 5 } else { 1 };
+        for i in 0..num_echoes {
+            let file_path_echo = file_path.clone();
+            let primary_echo = primary_device.clone();
+            let echo_num = i + 1;
+            let delay = echo_delay * echo_num as f32;
+            let decay_factor = if reverb_decay > 0.0 {
+                reverb_decay.powf(echo_num as f32)
+            } else {
+                1.0
+            };
+            let echo_vol = volume * echo_volume * decay_factor;
+
+            // Stop spawning if volume becomes negligible
+            if echo_vol < 0.01 {
+                break;
+            }
+
             std::thread::spawn(move || {
-                let _ = play_on_device(&file_path_monitor, Some(&monitor), volume, start_time, end_time);
+                std::thread::sleep(std::time::Duration::from_secs_f32(delay));
+                if !STOP_ALL_FLAG.load(Ordering::SeqCst) {
+                    let _ = play_on_device(&file_path_echo, primary_echo.as_deref(), echo_vol, start_time, end_time, false, playback_speed);
+                }
             });
+        }
+    }
+
+    // Play to monitor device in a thread (if set and different from primary)
+    if let Some(ref monitor) = monitor_device {
+        if primary_device.as_ref() != Some(monitor) {
+            // Play normal sound to monitor device
+            let file_path_monitor = file_path.clone();
+            let monitor_clone = monitor.clone();
+            std::thread::spawn(move || {
+                let _ = play_on_device(&file_path_monitor, Some(&monitor_clone), volume, start_time, end_time, loop_mode, playback_speed);
+            });
+
+            // Play echo/reverb on monitor device
+            if echo_delay > 0.0 && echo_volume > 0.0 {
+                let num_echoes = if reverb_decay > 0.0 { 5 } else { 1 };
+                for i in 0..num_echoes {
+                    let file_path_echo = file_path.clone();
+                    let monitor_echo = monitor.clone();
+                    let echo_num = i + 1;
+                    let delay = echo_delay * echo_num as f32;
+                    let decay_factor = if reverb_decay > 0.0 {
+                        reverb_decay.powf(echo_num as f32)
+                    } else {
+                        1.0
+                    };
+                    let echo_vol = volume * echo_volume * decay_factor;
+
+                    if echo_vol < 0.01 {
+                        break;
+                    }
+
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs_f32(delay));
+                        if !STOP_ALL_FLAG.load(Ordering::SeqCst) {
+                            let _ = play_on_device(&file_path_echo, Some(&monitor_echo), echo_vol, start_time, end_time, false, playback_speed);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    // Play bass boost on primary device (low-pass filtered extra bass layer)
+    if bass_boost > 0.0 {
+        let file_path_bass = file_path.clone();
+        let primary_bass = primary_device.clone();
+        let bass_vol = volume * bass_boost;
+        std::thread::spawn(move || {
+            let _ = play_bass_boost(&file_path_bass, primary_bass.as_deref(), bass_vol, start_time, end_time, playback_speed);
+        });
+
+        // Also play bass boost on monitor device
+        if let Some(ref monitor) = monitor_device {
+            if primary_device.as_ref() != Some(monitor) {
+                let file_path_bass = file_path.clone();
+                let monitor_bass = monitor.clone();
+                std::thread::spawn(move || {
+                    let _ = play_bass_boost(&file_path_bass, Some(&monitor_bass), bass_vol, start_time, end_time, playback_speed);
+                });
+            }
         }
     }
 
@@ -808,7 +1268,143 @@ fn play_sound(sound_id: String, state: State<AppState>) -> Result<(), String> {
 fn stop_all() -> Result<(), String> {
     // Set the global stop flag to signal all playing sounds to stop
     STOP_ALL_FLAG.store(true, Ordering::SeqCst);
+    // Also stop queue playback
+    QUEUE_PLAYING.store(false, Ordering::SeqCst);
     Ok(())
+}
+
+#[tauri::command]
+fn add_to_queue(sound_id: String) -> Result<Vec<String>, String> {
+    let mut queue = SOUND_QUEUE.lock().map_err(|e| e.to_string())?;
+    queue.push(sound_id);
+    Ok(queue.clone())
+}
+
+#[tauri::command]
+fn remove_from_queue(index: usize) -> Result<Vec<String>, String> {
+    let mut queue = SOUND_QUEUE.lock().map_err(|e| e.to_string())?;
+    if index < queue.len() {
+        queue.remove(index);
+    }
+    Ok(queue.clone())
+}
+
+#[tauri::command]
+fn clear_queue() -> Result<(), String> {
+    let mut queue = SOUND_QUEUE.lock().map_err(|e| e.to_string())?;
+    queue.clear();
+    QUEUE_PLAYING.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_queue() -> Result<Vec<String>, String> {
+    let queue = SOUND_QUEUE.lock().map_err(|e| e.to_string())?;
+    Ok(queue.clone())
+}
+
+#[tauri::command]
+fn play_queue(state: State<AppState>) -> Result<(), String> {
+    // Don't start if already playing
+    if QUEUE_PLAYING.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let queue = SOUND_QUEUE.lock().map_err(|e| e.to_string())?.clone();
+    if queue.is_empty() {
+        return Ok(());
+    }
+
+    // Reset stop flag if it was set from a previous stop_all
+    if STOP_ALL_FLAG.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        STOP_ALL_FLAG.store(false, Ordering::SeqCst);
+    }
+
+    // Get all sound data we need
+    let audio_state = state.lock().map_err(|e| e.to_string())?;
+    let sounds_data: Vec<_> = queue.iter().filter_map(|id| {
+        audio_state.sounds.get(id).map(|s| {
+            (
+                s.file_path.clone(),
+                audio_state.master_volume * s.volume,
+                s.start_time,
+                s.end_time,
+                s.playback_speed,
+            )
+        })
+    }).collect();
+    let primary_device = audio_state.primary_device.clone();
+    let monitor_device = audio_state.monitor_device.clone();
+    let crossfade_ms = audio_state.crossfade_duration;
+    drop(audio_state);
+
+    if sounds_data.is_empty() {
+        return Ok(());
+    }
+
+    QUEUE_PLAYING.store(true, Ordering::SeqCst);
+
+    // Spawn thread to play queue sequentially on primary device
+    let sounds_for_primary = sounds_data.clone();
+    let primary_clone = primary_device.clone();
+    std::thread::spawn(move || {
+        for (i, (file_path, volume, start_time, end_time, speed)) in sounds_for_primary.iter().enumerate() {
+            if !QUEUE_PLAYING.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Play on primary device with optional crossfade
+            let fade_duration = if i > 0 && crossfade_ms > 0 {
+                Some(std::time::Duration::from_millis(crossfade_ms as u64))
+            } else {
+                None
+            };
+            let _ = play_on_device_with_fade(file_path, primary_clone.as_deref(), *volume, *start_time, *end_time, fade_duration, *speed);
+
+            // Small gap between sounds (reduced if crossfade enabled)
+            if crossfade_ms == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
+        QUEUE_PLAYING.store(false, Ordering::SeqCst);
+        // Clear queue after playing
+        if let Ok(mut queue) = SOUND_QUEUE.lock() {
+            queue.clear();
+        }
+    });
+
+    // Also play on monitor device in parallel (for voice chat output)
+    if let Some(monitor) = monitor_device {
+        if primary_device.as_ref() != Some(&monitor) {
+            std::thread::spawn(move || {
+                for (i, (file_path, volume, start_time, end_time, speed)) in sounds_data.iter().enumerate() {
+                    if !QUEUE_PLAYING.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let fade_duration = if i > 0 && crossfade_ms > 0 {
+                        Some(std::time::Duration::from_millis(crossfade_ms as u64))
+                    } else {
+                        None
+                    };
+                    let _ = play_on_device_with_fade(file_path, Some(&monitor), *volume, *start_time, *end_time, fade_duration, *speed);
+
+                    if crossfade_ms == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            });
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn is_queue_playing() -> bool {
+    QUEUE_PLAYING.load(Ordering::SeqCst)
 }
 
 // Convert frontend keybind format to Tauri accelerator format
@@ -870,6 +1466,13 @@ fn play_sound_by_id(sound_id: String) {
         let volume = audio_state.master_volume * sound.volume;
         let start_time = sound.start_time;
         let end_time = sound.end_time;
+        let loop_mode = sound.loop_mode;
+        let playback_speed = sound.playback_speed;
+        let echo_delay = sound.echo_delay;
+        let echo_volume = sound.echo_volume;
+        let reverb_decay = sound.reverb_decay;
+        let bass_boost = sound.bass_boost;
+        let fake_bass_boost = sound.fake_bass_boost;
         let overlap_mode = audio_state.overlap_mode;
 
         drop(audio_state);
@@ -886,28 +1489,151 @@ fn play_sound_by_id(sound_id: String) {
             STOP_ALL_FLAG.store(false, Ordering::SeqCst);
         }
 
-        // Play to primary device
+        // If extreme bass is enabled, play that INSTEAD of everything else (exclusive mode)
+        if fake_bass_boost > 0.0 {
+            let file_path_extreme = file_path.clone();
+            let primary_extreme = primary_device.clone();
+            let extreme_vol = volume * fake_bass_boost;
+            std::thread::Builder::new()
+                .name("extreme_bass_player".to_string())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    let _ = play_fake_bass_boost(&file_path_extreme, primary_extreme.as_deref(), extreme_vol, start_time, end_time, playback_speed);
+                })
+                .ok();
+
+            // Play extreme bass on monitor device too
+            if let Some(ref monitor) = monitor_device {
+                if primary_device.as_ref() != Some(monitor) {
+                    let file_path_extreme = file_path;
+                    let monitor_extreme = monitor.clone();
+                    std::thread::Builder::new()
+                        .name("monitor_extreme_bass".to_string())
+                        .spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            let _ = play_fake_bass_boost(&file_path_extreme, Some(&monitor_extreme), extreme_vol, start_time, end_time, playback_speed);
+                        })
+                        .ok();
+                }
+            }
+
+            // Extreme bass is exclusive - skip all other effects
+            return;
+        }
+
+        // Play normal sound to primary device
         let file_path_primary = file_path.clone();
         let primary = primary_device.clone();
         std::thread::Builder::new()
             .name("sound_player".to_string())
             .spawn(move || {
-                // Small delay to ensure audio device is ready (helps with game audio conflicts)
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                let _ = play_on_device(&file_path_primary, primary.as_deref(), volume, start_time, end_time);
+                let _ = play_on_device(&file_path_primary, primary.as_deref(), volume, start_time, end_time, loop_mode, playback_speed);
             })
             .ok();
 
+        // Play echo/reverb on primary device
+        if echo_delay > 0.0 && echo_volume > 0.0 {
+            let num_echoes = if reverb_decay > 0.0 { 5 } else { 1 };
+            for i in 0..num_echoes {
+                let file_path_echo = file_path.clone();
+                let primary_echo = primary_device.clone();
+                let echo_num = i + 1;
+                let delay = echo_delay * echo_num as f32;
+                let decay_factor = if reverb_decay > 0.0 {
+                    reverb_decay.powf(echo_num as f32)
+                } else {
+                    1.0
+                };
+                let echo_vol = volume * echo_volume * decay_factor;
+
+                if echo_vol < 0.01 {
+                    break;
+                }
+
+                std::thread::Builder::new()
+                    .name(format!("echo_player_{}", echo_num))
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs_f32(delay));
+                        if !STOP_ALL_FLAG.load(Ordering::SeqCst) {
+                            let _ = play_on_device(&file_path_echo, primary_echo.as_deref(), echo_vol, start_time, end_time, false, playback_speed);
+                        }
+                    })
+                    .ok();
+            }
+        }
+
         // Play to monitor device
-        if let Some(monitor) = monitor_device {
-            if primary_device.as_ref() != Some(&monitor) {
+        if let Some(ref monitor) = monitor_device {
+            if primary_device.as_ref() != Some(monitor) {
+                // Play normal sound to monitor device
+                let file_path_monitor = file_path.clone();
+                let monitor_clone = monitor.clone();
                 std::thread::Builder::new()
                     .name("monitor_player".to_string())
                     .spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(10));
-                        let _ = play_on_device(&file_path, Some(&monitor), volume, start_time, end_time);
+                        let _ = play_on_device(&file_path_monitor, Some(&monitor_clone), volume, start_time, end_time, loop_mode, playback_speed);
                     })
                     .ok();
+
+                // Play echo/reverb on monitor device
+                if echo_delay > 0.0 && echo_volume > 0.0 {
+                    let num_echoes = if reverb_decay > 0.0 { 5 } else { 1 };
+                    for i in 0..num_echoes {
+                        let file_path_echo = file_path.clone();
+                        let monitor_echo = monitor.clone();
+                        let echo_num = i + 1;
+                        let delay = echo_delay * echo_num as f32;
+                        let decay_factor = if reverb_decay > 0.0 {
+                            reverb_decay.powf(echo_num as f32)
+                        } else {
+                            1.0
+                        };
+                        let echo_vol = volume * echo_volume * decay_factor;
+
+                        if echo_vol < 0.01 {
+                            break;
+                        }
+
+                        std::thread::Builder::new()
+                            .name(format!("monitor_echo_{}", echo_num))
+                            .spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_secs_f32(delay));
+                                if !STOP_ALL_FLAG.load(Ordering::SeqCst) {
+                                    let _ = play_on_device(&file_path_echo, Some(&monitor_echo), echo_vol, start_time, end_time, false, playback_speed);
+                                }
+                            })
+                            .ok();
+                    }
+                }
+            }
+        }
+
+        // Play bass boost on primary device
+        if bass_boost > 0.0 {
+            let file_path_bass = file_path.clone();
+            let primary_bass = primary_device.clone();
+            let bass_vol = volume * bass_boost;
+            std::thread::Builder::new()
+                .name("bass_boost".to_string())
+                .spawn(move || {
+                    let _ = play_bass_boost(&file_path_bass, primary_bass.as_deref(), bass_vol, start_time, end_time, playback_speed);
+                })
+                .ok();
+
+            // Also play bass boost on monitor device
+            if let Some(ref monitor) = monitor_device {
+                if primary_device.as_ref() != Some(monitor) {
+                    let file_path_bass = file_path;
+                    let monitor_bass = monitor.clone();
+                    std::thread::Builder::new()
+                        .name("monitor_bass_boost".to_string())
+                        .spawn(move || {
+                            let _ = play_bass_boost(&file_path_bass, Some(&monitor_bass), bass_vol, start_time, end_time, playback_speed);
+                        })
+                        .ok();
+                }
             }
         }
     }
@@ -1084,6 +1810,7 @@ fn main() {
             initial_state.theme = settings.theme;
             initial_state.minimize_to_tray = settings.minimize_to_tray;
             initial_state.overlap_mode = settings.overlap_mode;
+            initial_state.crossfade_duration = settings.crossfade_duration;
         }
     }
 
@@ -1177,9 +1904,16 @@ fn main() {
             remove_sound,
             update_sound_keybind,
             update_sound_trim,
+            update_sound_settings,
             update_sound_order,
             play_sound,
             stop_all,
+            add_to_queue,
+            remove_from_queue,
+            clear_queue,
+            get_queue,
+            play_queue,
+            is_queue_playing,
             register_sound_keybind,
             unregister_sound_keybind,
             register_stop_all_keybind,
@@ -1189,6 +1923,7 @@ fn main() {
             set_theme,
             set_minimize_to_tray,
             set_overlap_mode,
+            set_crossfade_duration,
             get_current_version,
             check_for_updates,
             install_update,
