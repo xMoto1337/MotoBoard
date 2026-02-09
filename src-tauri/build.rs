@@ -17,5 +17,17 @@ fn main() {
 
     // Rerun if Cargo.toml changes
     println!("cargo:rerun-if-changed=Cargo.toml");
-    tauri_build::build()
+
+    // Only embed requireAdministrator manifest for release builds
+    let is_release = std::env::var("PROFILE").unwrap_or_default() == "release";
+
+    let attrs = if is_release {
+        let windows_attrs = tauri_build::WindowsAttributes::new()
+            .app_manifest(include_str!("app.manifest"));
+        tauri_build::Attributes::new().windows_attributes(windows_attrs)
+    } else {
+        tauri_build::Attributes::new()
+    };
+
+    tauri_build::try_build(attrs).expect("failed to run tauri build");
 }
