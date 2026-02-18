@@ -1714,6 +1714,174 @@ fn unregister_stop_all_keybind(app_handle: AppHandle, keybind: String) -> Result
     Ok(())
 }
 
+// ===== AUDIO TOOLS: Media to MP3 Converter =====
+#[tauri::command]
+fn convert_to_audio(input_path: String, output_path: String) -> Result<String, String> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+    use mp3lame_encoder::{Builder, FlushNoGap};
+    use std::mem::MaybeUninit;
+
+    // Open the input file
+    let file = File::open(&input_path)
+        .map_err(|e| format!("Failed to open input file: {}", e))?;
+
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = std::path::Path::new(&input_path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    // Probe the format
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| format!("Failed to probe format: {}. Make sure this is a valid audio/video file.", e))?;
+
+    let mut format = probed.format;
+
+    // Find the first audio track
+    let track = format.tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or_else(|| "No audio track found in the file".to_string())?;
+
+    let track_id = track.id;
+    let codec_params = track.codec_params.clone();
+
+    // Get sample rate from codec params (required)
+    let sample_rate = codec_params.sample_rate
+        .ok_or_else(|| "Could not determine sample rate".to_string())?;
+
+    // Channel count may not be in codec params (e.g. AAC in MP4)
+    // We'll detect it from the first decoded packet if needed
+    let hint_channels = codec_params.channels.map(|c| c.count() as u16);
+
+    // Create a decoder
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("Failed to create decoder: {}", e))?;
+
+    // First pass: decode all audio into a buffer, detecting channels from actual audio
+    let mut all_samples: Vec<i16> = Vec::new();
+    let mut detected_channels: Option<u16> = hint_channels;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(symphonia::core::errors::Error::ResetRequired) => break,
+            Err(e) => return Err(format!("Error reading packet: {}", e)),
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+            Err(e) => return Err(format!("Error decoding audio: {}", e)),
+        };
+
+        // Detect channels from actual decoded audio if not known
+        if detected_channels.is_none() {
+            detected_channels = Some(decoded.spec().channels.count() as u16);
+        }
+
+        let mut sample_buf = SampleBuffer::<i16>::new(decoded.capacity() as u64, *decoded.spec());
+        sample_buf.copy_interleaved_ref(decoded);
+        all_samples.extend_from_slice(sample_buf.samples());
+    }
+
+    let channels = detected_channels.unwrap_or(2);
+
+    if all_samples.is_empty() {
+        return Err("No audio data could be decoded from the file".to_string());
+    }
+
+    // Encode to MP3 using LAME
+    let mut mp3_encoder = Builder::new().ok_or("Failed to create MP3 encoder")?;
+    mp3_encoder.set_num_channels(channels as u8)
+        .map_err(|e| format!("Failed to set channels: {:?}", e))?;
+    mp3_encoder.set_sample_rate(sample_rate)
+        .map_err(|e| format!("Failed to set sample rate: {:?}", e))?;
+    mp3_encoder.set_brate(mp3lame_encoder::Birtate::Kbps192)
+        .map_err(|e| format!("Failed to set bitrate: {:?}", e))?;
+    mp3_encoder.set_quality(mp3lame_encoder::Quality::Best)
+        .map_err(|e| format!("Failed to set quality: {:?}", e))?;
+
+    let mut encoder = mp3_encoder.build()
+        .map_err(|e| format!("Failed to build MP3 encoder: {:?}", e))?;
+
+    // Helper to convert MaybeUninit slice to initialized bytes
+    fn uninit_buf(size: usize) -> Vec<MaybeUninit<u8>> {
+        let mut buf = Vec::with_capacity(size);
+        buf.resize_with(size, MaybeUninit::uninit);
+        buf
+    }
+
+    fn assume_init(buf: &[MaybeUninit<u8>], len: usize) -> Vec<u8> {
+        buf[..len].iter().map(|b| unsafe { b.assume_init() }).collect()
+    }
+
+    // Encode samples
+    let mp3_data = if channels == 1 {
+        // Mono
+        let input = mp3lame_encoder::MonoPcm(&all_samples);
+        let mut mp3_out = uninit_buf(mp3lame_encoder::max_required_buffer_size(all_samples.len()));
+        let encoded_size = encoder.encode(input, &mut mp3_out)
+            .map_err(|e| format!("MP3 encoding error: {:?}", e))?;
+        let mut result = assume_init(&mp3_out, encoded_size);
+
+        // Flush remaining
+        let mut flush_buf = uninit_buf(7200);
+        let flush_size = encoder.flush::<FlushNoGap>(&mut flush_buf)
+            .map_err(|e| format!("MP3 flush error: {:?}", e))?;
+        result.extend_from_slice(&assume_init(&flush_buf, flush_size));
+        result
+    } else {
+        // Stereo - deinterleave
+        let frame_count = all_samples.len() / channels as usize;
+        let mut left = Vec::with_capacity(frame_count);
+        let mut right = Vec::with_capacity(frame_count);
+        for i in 0..frame_count {
+            left.push(all_samples[i * channels as usize]);
+            right.push(all_samples[i * channels as usize + 1]);
+        }
+        let input = mp3lame_encoder::DualPcm { left: &left, right: &right };
+        let mut mp3_out = uninit_buf(mp3lame_encoder::max_required_buffer_size(frame_count));
+        let encoded_size = encoder.encode(input, &mut mp3_out)
+            .map_err(|e| format!("MP3 encoding error: {:?}", e))?;
+        let mut result = assume_init(&mp3_out, encoded_size);
+
+        // Flush remaining
+        let mut flush_buf = uninit_buf(7200);
+        let flush_size = encoder.flush::<FlushNoGap>(&mut flush_buf)
+            .map_err(|e| format!("MP3 flush error: {:?}", e))?;
+        result.extend_from_slice(&assume_init(&flush_buf, flush_size));
+        result
+    };
+
+    // Write MP3 file
+    std::fs::write(&output_path, &mp3_data)
+        .map_err(|e| format!("Failed to write MP3 file: {}", e))?;
+
+    let total_frames = all_samples.len() as u64 / channels as u64;
+    let duration_secs = total_frames / sample_rate as u64;
+    let minutes = duration_secs / 60;
+    let seconds = duration_secs % 60;
+    let file_size_kb = mp3_data.len() / 1024;
+
+    Ok(format!("Converted to MP3! Duration: {}:{:02} | {} Hz, {} ch | {}KB @ 192kbps",
+        minutes, seconds, sample_rate, channels, file_size_kb))
+}
+
 #[tauri::command]
 fn get_current_version() -> String {
     VERSION.to_string()
@@ -1929,6 +2097,7 @@ fn main() {
             install_update,
             get_last_key_press,
             get_registered_keybinds,
+            convert_to_audio,
         ])
         .setup(move |app| {
             // Store app handle globally for use in shortcut callbacks

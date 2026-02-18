@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/tauri'
-import { open } from '@tauri-apps/api/dialog'
+import { open, save } from '@tauri-apps/api/dialog'
 import { readBinaryFile } from '@tauri-apps/api/fs'
 
 interface Sound {
@@ -66,6 +66,11 @@ function App() {
   const [dragOverSound, setDragOverSound] = useState<string | null>(null)
   const [soundQueue, setSoundQueue] = useState<string[]>([])
   const [isQueuePlaying, setIsQueuePlaying] = useState(false)
+  const [activeTab, setActiveTab] = useState<'soundboard' | 'tools'>('soundboard')
+  const [convertInput, setConvertInput] = useState('')
+  const [convertOutput, setConvertOutput] = useState('')
+  const [convertStatus, setConvertStatus] = useState<'idle' | 'converting' | 'done' | 'error'>('idle')
+  const [convertResult, setConvertResult] = useState('')
   const consoleRef = useRef<HTMLDivElement>(null)
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null)
   const previewAudioRef = useRef<HTMLAudioElement | null>(null)
@@ -892,6 +897,20 @@ function App() {
             )}
           </div>
         </div>
+        <div className="tab-nav">
+          <button
+            className={`tab-btn ${activeTab === 'soundboard' ? 'active' : ''}`}
+            onClick={() => setActiveTab('soundboard')}
+          >
+            Soundboard
+          </button>
+          <button
+            className={`tab-btn ${activeTab === 'tools' ? 'active' : ''}`}
+            onClick={() => setActiveTab('tools')}
+          >
+            Audio Tools
+          </button>
+        </div>
         <div className="header-controls">
           <button className="btn btn-danger" onClick={stopAllSounds}>
             Stop All {stopAllKeybind && <span className="btn-keybind">[{stopAllKeybind}]</span>}
@@ -917,7 +936,7 @@ function App() {
       </header>
 
       {/* Main Content */}
-      <div className="main-content">
+      <div className="main-content" style={{ display: activeTab === 'soundboard' ? '' : 'none' }}>
         {/* Sound Grid */}
         <div className="sound-grid">
           {sounds.map((sound) => (
@@ -1022,6 +1041,144 @@ function App() {
           </div>
         </aside>
       </div>
+
+      {/* Audio Tools View */}
+      {activeTab === 'tools' && (
+        <div className="tools-view">
+          <div className="tools-container">
+            {/* Video/Audio to WAV Converter */}
+            <div className="tool-card">
+              <div className="tool-card-header">
+                <div className="tool-icon">&#9835;</div>
+                <div>
+                  <h2 className="tool-title">Media Converter</h2>
+                  <p className="tool-subtitle">Convert video and audio files to MP3</p>
+                </div>
+              </div>
+
+              <div className="tool-formats">
+                <div className="format-group">
+                  <span className="format-label">Supported Input</span>
+                  <div className="format-tags">
+                    <span className="format-tag">MP4</span>
+                    <span className="format-tag">MKV</span>
+                    <span className="format-tag">WebM</span>
+                    <span className="format-tag">MP3</span>
+                    <span className="format-tag">OGG</span>
+                    <span className="format-tag">FLAC</span>
+                    <span className="format-tag">WAV</span>
+                    <span className="format-tag">M4A</span>
+                    <span className="format-tag">AAC</span>
+                  </div>
+                </div>
+                <div className="format-group">
+                  <span className="format-label">Output</span>
+                  <div className="format-tags">
+                    <span className="format-tag output">MP3 (192kbps)</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="converter-section">
+                <div className="converter-field">
+                  <label>Input File</label>
+                  <div className="converter-input-row">
+                    <input
+                      type="text"
+                      className="converter-path"
+                      value={convertInput}
+                      readOnly
+                      placeholder="Select a video or audio file..."
+                    />
+                    <button
+                      className="btn btn-primary"
+                      onClick={async () => {
+                        const selected = await open({
+                          filters: [{
+                            name: 'Media Files',
+                            extensions: ['mp4', 'mkv', 'webm', 'mp3', 'ogg', 'flac', 'wav', 'm4a', 'aac', 'mov', 'avi', 'wma']
+                          }]
+                        })
+                        if (selected && typeof selected === 'string') {
+                          setConvertInput(selected)
+                          // Auto-generate output path
+                          const outputPath = selected.replace(/\.[^.]+$/, '.mp3')
+                          setConvertOutput(outputPath)
+                          setConvertStatus('idle')
+                          setConvertResult('')
+                        }
+                      }}
+                    >
+                      Browse
+                    </button>
+                  </div>
+                </div>
+
+                <div className="converter-field">
+                  <label>Output File</label>
+                  <div className="converter-input-row">
+                    <input
+                      type="text"
+                      className="converter-path"
+                      value={convertOutput}
+                      readOnly
+                      placeholder="Output file path..."
+                    />
+                    <button
+                      className="btn btn-outline"
+                      onClick={async () => {
+                        const selected = await save({
+                          defaultPath: convertOutput || undefined,
+                          filters: [{ name: 'MP3 Audio', extensions: ['mp3'] }]
+                        })
+                        if (selected) {
+                          setConvertOutput(selected)
+                        }
+                      }}
+                    >
+                      Save As
+                    </button>
+                  </div>
+                </div>
+
+                <div className="converter-actions">
+                  <button
+                    className={`btn btn-convert ${convertStatus === 'converting' ? 'converting' : ''}`}
+                    disabled={!convertInput || !convertOutput || convertStatus === 'converting'}
+                    onClick={async () => {
+                      setConvertStatus('converting')
+                      setConvertResult('')
+                      try {
+                        const result = await invoke<string>('convert_to_audio', {
+                          inputPath: convertInput,
+                          outputPath: convertOutput
+                        })
+                        setConvertStatus('done')
+                        setConvertResult(result)
+                        addLog(`[Converter] ${result}`, 'info')
+                      } catch (error) {
+                        setConvertStatus('error')
+                        setConvertResult(String(error))
+                        addLog(`[Converter] Error: ${error}`, 'error')
+                      }
+                    }}
+                  >
+                    {convertStatus === 'converting' ? 'Converting...' : 'Convert'}
+                  </button>
+                </div>
+
+                {convertResult && (
+                  <div className={`converter-result ${convertStatus}`}>
+                    {convertStatus === 'done' && <span className="result-icon">&#10003;</span>}
+                    {convertStatus === 'error' && <span className="result-icon">&#10007;</span>}
+                    <span>{convertResult}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Console Panel */}
       {showConsole && (
