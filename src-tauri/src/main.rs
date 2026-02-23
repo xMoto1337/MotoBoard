@@ -1714,6 +1714,310 @@ fn unregister_stop_all_keybind(app_handle: AppHandle, keybind: String) -> Result
     Ok(())
 }
 
+// ===== AUDIO TOOLS: Voice Recorder =====
+// Note: cpal::Stream is !Send on WASAPI, so we keep it confined to a dedicated
+// recording thread and communicate via channels.
+
+lazy_static::lazy_static! {
+    static ref RECORDING_SAMPLES: Mutex<Vec<f32>> = Mutex::new(Vec::new());
+    static ref RECORDING_LEVEL: Mutex<f32> = Mutex::new(0.0);
+    static ref RECORDING_INFO: Mutex<Option<(u32, u16)>> = Mutex::new(None);
+    // SyncSender<()> is Send+Sync, safe to store in lazy_static
+    static ref RECORDER_STOP_TX: Mutex<Option<std::sync::mpsc::SyncSender<()>>> = Mutex::new(None);
+    // Path of the last temp recording file (for preview before save)
+    static ref LAST_RECORDING_TEMP: Mutex<Option<String>> = Mutex::new(None);
+}
+
+static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+fn get_input_devices() -> Vec<AudioDevice> {
+    use rodio::cpal::traits::{HostTrait, DeviceTrait};
+    let host = rodio::cpal::default_host();
+    let mut devices = Vec::new();
+    if let Ok(input_devices) = host.input_devices() {
+        for (idx, device) in input_devices.enumerate() {
+            if let Ok(name) = device.name() {
+                devices.push(AudioDevice { id: idx as i32, name });
+            }
+        }
+    }
+    devices
+}
+
+#[tauri::command]
+fn start_recording(device_name: Option<String>) -> Result<(), String> {
+    if IS_RECORDING.load(Ordering::SeqCst) {
+        return Err("Already recording".to_string());
+    }
+
+    // Clear previous recording data
+    {
+        let mut samples = RECORDING_SAMPLES.lock().map_err(|e| e.to_string())?;
+        samples.clear();
+    }
+    {
+        let mut level = RECORDING_LEVEL.lock().map_err(|e| e.to_string())?;
+        *level = 0.0;
+    }
+
+    // Channels: stop signal (caller → thread) and ready notification (thread → caller)
+    let (stop_tx, stop_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+
+    {
+        let mut tx_guard = RECORDER_STOP_TX.lock().map_err(|e| e.to_string())?;
+        *tx_guard = Some(stop_tx);
+    }
+
+    // The recording thread owns the cpal::Stream - it never crosses thread boundary
+    std::thread::spawn(move || {
+        use rodio::cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
+
+        let host = rodio::cpal::default_host();
+        let device = if let Some(ref name) = device_name {
+            let found = host.input_devices().ok()
+                .and_then(|mut devs| devs.find(|d| d.name().ok().as_deref() == Some(name.as_str())));
+            found.or_else(|| host.default_input_device())
+        } else {
+            host.default_input_device()
+        };
+
+        let device = match device {
+            Some(d) => d,
+            None => { let _ = ready_tx.send(Err("No input device available".to_string())); return; }
+        };
+
+        let config = match device.default_input_config() {
+            Ok(c) => c,
+            Err(e) => { let _ = ready_tx.send(Err(format!("Failed to get input config: {}", e))); return; }
+        };
+
+        let sample_rate = config.sample_rate().0;
+        let channels = config.channels();
+        let sample_format = config.sample_format();
+        let stream_config: rodio::cpal::StreamConfig = config.into();
+
+        if let Ok(mut info) = RECORDING_INFO.lock() {
+            *info = Some((sample_rate, channels as u16));
+        }
+
+        let stream_result = match sample_format {
+            rodio::cpal::SampleFormat::F32 => {
+                device.build_input_stream(
+                    &stream_config,
+                    |data: &[f32], _: &rodio::cpal::InputCallbackInfo| {
+                        if let Ok(mut s) = RECORDING_SAMPLES.lock() { s.extend_from_slice(data); }
+                        if !data.is_empty() {
+                            let rms = (data.iter().map(|s| s * s).sum::<f32>() / data.len() as f32).sqrt();
+                            if let Ok(mut l) = RECORDING_LEVEL.lock() { *l = rms; }
+                        }
+                    },
+                    |err| eprintln!("Recording error: {}", err),
+                    None,
+                )
+            }
+            rodio::cpal::SampleFormat::I16 => {
+                device.build_input_stream(
+                    &stream_config,
+                    |data: &[i16], _: &rodio::cpal::InputCallbackInfo| {
+                        if let Ok(mut s) = RECORDING_SAMPLES.lock() {
+                            for &v in data { s.push(v as f32 / 32768.0); }
+                        }
+                        if !data.is_empty() {
+                            let rms = (data.iter().map(|&v| { let f = v as f32 / 32768.0; f * f })
+                                .sum::<f32>() / data.len() as f32).sqrt();
+                            if let Ok(mut l) = RECORDING_LEVEL.lock() { *l = rms; }
+                        }
+                    },
+                    |err| eprintln!("Recording error: {}", err),
+                    None,
+                )
+            }
+            rodio::cpal::SampleFormat::U16 => {
+                device.build_input_stream(
+                    &stream_config,
+                    |data: &[u16], _: &rodio::cpal::InputCallbackInfo| {
+                        if let Ok(mut s) = RECORDING_SAMPLES.lock() {
+                            for &v in data { s.push((v as f32 / 32768.0) - 1.0); }
+                        }
+                        if !data.is_empty() {
+                            let rms = (data.iter().map(|&v| { let f = (v as f32 / 32768.0) - 1.0; f * f })
+                                .sum::<f32>() / data.len() as f32).sqrt();
+                            if let Ok(mut l) = RECORDING_LEVEL.lock() { *l = rms; }
+                        }
+                    },
+                    |err| eprintln!("Recording error: {}", err),
+                    None,
+                )
+            }
+            _ => {
+                let _ = ready_tx.send(Err(format!("Unsupported audio format: {:?}", sample_format)));
+                return;
+            }
+        };
+
+        let stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => { let _ = ready_tx.send(Err(format!("Failed to build stream: {}", e))); return; }
+        };
+
+        if let Err(e) = stream.play() {
+            let _ = ready_tx.send(Err(format!("Failed to start recording: {}", e)));
+            return;
+        }
+
+        IS_RECORDING.store(true, Ordering::SeqCst);
+        let _ = ready_tx.send(Ok(())); // Notify caller that recording started
+
+        // Block until stop signal - keeps the stream alive
+        let _ = stop_rx.recv();
+
+        drop(stream); // Stops capture
+        if let Ok(mut l) = RECORDING_LEVEL.lock() { *l = 0.0; }
+    });
+
+    // Wait for ready signal from recording thread (up to 5s)
+    ready_rx.recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| "Recording startup timed out".to_string())?
+}
+
+/// Stop recording, encode to a temp file, and return the temp file path for preview.
+#[tauri::command]
+fn finish_recording() -> Result<String, String> {
+    use mp3lame_encoder::{Builder, FlushNoGap};
+    use std::mem::MaybeUninit;
+
+    // Send stop signal to recording thread
+    let stop_tx = {
+        let mut tx_guard = RECORDER_STOP_TX.lock().map_err(|e| e.to_string())?;
+        tx_guard.take()
+    };
+
+    match stop_tx {
+        Some(tx) => { let _ = tx.send(()); }
+        None if !IS_RECORDING.load(Ordering::SeqCst) => {
+            return Err("Not currently recording".to_string());
+        }
+        None => {}
+    }
+
+    // Wait for the recording thread to finish flushing
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    IS_RECORDING.store(false, Ordering::SeqCst);
+
+    let (sample_rate, channels) = {
+        let info = RECORDING_INFO.lock().map_err(|e| e.to_string())?;
+        info.ok_or_else(|| "No recording info available".to_string())?
+    };
+
+    let samples_f32: Vec<f32> = {
+        let mut s = RECORDING_SAMPLES.lock().map_err(|e| e.to_string())?;
+        std::mem::take(&mut *s)
+    };
+
+    if samples_f32.is_empty() {
+        return Err("No audio was recorded".to_string());
+    }
+
+    let samples_i16: Vec<i16> = samples_f32.iter()
+        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+        .collect();
+
+    let mut mp3_encoder = Builder::new().ok_or("Failed to create MP3 encoder")?;
+    let num_channels = channels.min(2);
+    mp3_encoder.set_num_channels(num_channels as u8)
+        .map_err(|e| format!("Failed to set channels: {:?}", e))?;
+    mp3_encoder.set_sample_rate(sample_rate)
+        .map_err(|e| format!("Failed to set sample rate: {:?}", e))?;
+    mp3_encoder.set_brate(mp3lame_encoder::Birtate::Kbps192)
+        .map_err(|e| format!("Failed to set bitrate: {:?}", e))?;
+    mp3_encoder.set_quality(mp3lame_encoder::Quality::Best)
+        .map_err(|e| format!("Failed to set quality: {:?}", e))?;
+
+    let mut encoder = mp3_encoder.build()
+        .map_err(|e| format!("Failed to build encoder: {:?}", e))?;
+
+    fn rec_uninit_buf(size: usize) -> Vec<MaybeUninit<u8>> {
+        let mut buf = Vec::with_capacity(size);
+        buf.resize_with(size, MaybeUninit::uninit);
+        buf
+    }
+
+    fn rec_assume_init(buf: &[MaybeUninit<u8>], len: usize) -> Vec<u8> {
+        buf[..len].iter().map(|b| unsafe { b.assume_init() }).collect()
+    }
+
+    let mp3_data = if channels == 1 {
+        let input = mp3lame_encoder::MonoPcm(&samples_i16);
+        let mut mp3_out = rec_uninit_buf(mp3lame_encoder::max_required_buffer_size(samples_i16.len()));
+        let encoded_size = encoder.encode(input, &mut mp3_out)
+            .map_err(|e| format!("MP3 encoding error: {:?}", e))?;
+        let mut result = rec_assume_init(&mp3_out, encoded_size);
+        let mut flush_buf = rec_uninit_buf(7200);
+        let flush_size = encoder.flush::<FlushNoGap>(&mut flush_buf)
+            .map_err(|e| format!("MP3 flush error: {:?}", e))?;
+        result.extend_from_slice(&rec_assume_init(&flush_buf, flush_size));
+        result
+    } else {
+        let frame_count = samples_i16.len() / channels as usize;
+        let mut left = Vec::with_capacity(frame_count);
+        let mut right = Vec::with_capacity(frame_count);
+        for i in 0..frame_count {
+            left.push(samples_i16[i * channels as usize]);
+            right.push(samples_i16[i * channels as usize + (channels as usize - 1).min(1)]);
+        }
+        let input = mp3lame_encoder::DualPcm { left: &left, right: &right };
+        let mut mp3_out = rec_uninit_buf(mp3lame_encoder::max_required_buffer_size(frame_count));
+        let encoded_size = encoder.encode(input, &mut mp3_out)
+            .map_err(|e| format!("MP3 encoding error: {:?}", e))?;
+        let mut result = rec_assume_init(&mp3_out, encoded_size);
+        let mut flush_buf = rec_uninit_buf(7200);
+        let flush_size = encoder.flush::<FlushNoGap>(&mut flush_buf)
+            .map_err(|e| format!("MP3 flush error: {:?}", e))?;
+        result.extend_from_slice(&rec_assume_init(&flush_buf, flush_size));
+        result
+    };
+
+    // Write to a temp file for preview
+    let temp_path = std::env::temp_dir().join("motoboard_recording_preview.mp3");
+    std::fs::write(&temp_path, &mp3_data)
+        .map_err(|e| format!("Failed to write temp recording: {}", e))?;
+
+    let temp_path_str = temp_path.to_string_lossy().to_string();
+
+    // Store temp path for save_recording to use
+    if let Ok(mut t) = LAST_RECORDING_TEMP.lock() {
+        *t = Some(temp_path_str.clone());
+    }
+
+    Ok(temp_path_str)
+}
+
+/// Copy the last temp recording to the user-chosen destination.
+#[tauri::command]
+fn save_recording(dest_path: String) -> Result<String, String> {
+    let temp_path = {
+        let guard = LAST_RECORDING_TEMP.lock().map_err(|e| e.to_string())?;
+        guard.clone().ok_or_else(|| "No recording to save".to_string())?
+    };
+
+    std::fs::copy(&temp_path, &dest_path)
+        .map_err(|e| format!("Failed to save recording: {}", e))?;
+
+    Ok(format!("Saved to {}", dest_path))
+}
+
+#[tauri::command]
+fn get_recording_level() -> f32 {
+    RECORDING_LEVEL.lock().map(|l| *l).unwrap_or(0.0)
+}
+
+#[tauri::command]
+fn is_recording() -> bool {
+    IS_RECORDING.load(Ordering::SeqCst)
+}
+
 // ===== AUDIO TOOLS: Media to MP3 Converter =====
 #[tauri::command]
 fn convert_to_audio(input_path: String, output_path: String) -> Result<String, String> {
@@ -2098,6 +2402,12 @@ fn main() {
             get_last_key_press,
             get_registered_keybinds,
             convert_to_audio,
+            get_input_devices,
+            start_recording,
+            finish_recording,
+            save_recording,
+            get_recording_level,
+            is_recording,
         ])
         .setup(move |app| {
             // Store app handle globally for use in shortcut callbacks

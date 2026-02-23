@@ -1578,3 +1578,312 @@ body {
   from { opacity: 0; transform: translateY(-5px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* ===== TOOL SUB-TABS ===== */
+.tool-subtabs {
+  display: flex;
+  gap: 4px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid #222;
+  border-radius: 8px;
+  padding: 3px;
+  margin-bottom: 20px;
+}
+
+.tool-subtab-btn {
+  flex: 1;
+  padding: 8px 20px;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: all 0.2s ease;
+  letter-spacing: 0.5px;
+}
+
+.tool-subtab-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.tool-subtab-btn.active {
+  color: var(--bg-dark);
+  background: var(--neon-primary);
+  font-weight: 600;
+  box-shadow: 0 0 12px color-mix(in srgb, var(--neon-primary) 40%, transparent);
+}
+
+/* ===== VOICE RECORDER ===== */
+.recorder-section {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.recorder-device-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.recorder-device-row label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+}
+
+.recorder-output-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.recorder-output-row label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+}
+
+.recorder-output-input-row {
+  display: flex;
+  gap: 8px;
+}
+
+.recorder-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 0;
+}
+
+.recorder-timer {
+  font-size: 32px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--neon-primary);
+  text-shadow: 0 0 16px color-mix(in srgb, var(--neon-primary) 60%, transparent);
+  letter-spacing: 4px;
+  font-family: 'Consolas', 'Courier New', monospace;
+}
+
+.recorder-timer.recording {
+  animation: timer-pulse 1s ease-in-out infinite;
+}
+
+@keyframes timer-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.btn-record {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: transparent;
+  border: 3px solid var(--neon-red);
+  color: var(--neon-red);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  box-shadow:
+    0 0 10px rgba(255, 0, 64, 0.4),
+    0 0 20px rgba(255, 0, 64, 0.2),
+    inset 0 0 15px rgba(255, 0, 64, 0.08);
+}
+
+.btn-record:hover {
+  background: rgba(255, 0, 64, 0.12);
+  box-shadow:
+    0 0 18px rgba(255, 0, 64, 0.6),
+    0 0 35px rgba(255, 0, 64, 0.3),
+    inset 0 0 20px rgba(255, 0, 64, 0.15);
+  transform: scale(1.05);
+}
+
+.btn-record.recording {
+  border-color: var(--neon-red);
+  background: rgba(255, 0, 64, 0.15);
+  animation: record-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes record-pulse {
+  0%, 100% {
+    box-shadow:
+      0 0 10px rgba(255, 0, 64, 0.5),
+      0 0 25px rgba(255, 0, 64, 0.25),
+      inset 0 0 15px rgba(255, 0, 64, 0.1);
+  }
+  50% {
+    box-shadow:
+      0 0 20px rgba(255, 0, 64, 0.8),
+      0 0 45px rgba(255, 0, 64, 0.5),
+      inset 0 0 25px rgba(255, 0, 64, 0.2);
+  }
+}
+
+.btn-record-icon {
+  width: 28px;
+  height: 28px;
+  background: var(--neon-red);
+  border-radius: 50%;
+  transition: border-radius 0.2s ease;
+  box-shadow: 0 0 8px rgba(255, 0, 64, 0.6);
+}
+
+.btn-record.recording .btn-record-icon {
+  border-radius: 4px;
+  width: 22px;
+  height: 22px;
+}
+
+.recorder-visualizer {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 72px;
+  width: 100%;
+  background: #070707;
+  border: 1px solid #1e1e1e;
+  border-radius: 10px;
+  padding: 10px 12px;
+  overflow: hidden;
+}
+
+.recorder-vis-bar {
+  flex: 1;
+  background: var(--neon-primary);
+  border-radius: 2px;
+  min-height: 3px;
+  transition: height 0.08s ease;
+  box-shadow: 0 0 4px color-mix(in srgb, var(--neon-primary) 50%, transparent);
+}
+
+.recorder-vis-bar.idle {
+  background: #2a2a2a;
+  box-shadow: none;
+}
+
+.recorder-status {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+  min-height: 20px;
+}
+
+.recorder-status.success {
+  color: var(--neon-primary);
+}
+
+.recorder-status.error {
+  color: var(--neon-red);
+}
+
+/* ===== RECORDER PREVIEW PLAYER ===== */
+.recorder-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 8px 0;
+}
+
+.recorder-preview-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.recorder-preview-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--neon-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  text-shadow: 0 0 8px color-mix(in srgb, var(--neon-primary) 50%, transparent);
+}
+
+.recorder-preview-dur {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: 'Consolas', 'Courier New', monospace;
+}
+
+.recorder-preview-progress-wrap {
+  width: 100%;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+}
+
+.recorder-preview-progress-bar {
+  height: 100%;
+  background: var(--neon-primary);
+  border-radius: 3px;
+  transition: width 0.1s linear;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--neon-primary) 60%, transparent);
+  min-width: 0;
+}
+
+.recorder-preview-time {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-family: 'Consolas', 'Courier New', monospace;
+  margin-top: -6px;
+}
+
+.recorder-preview-controls {
+  display: flex;
+  justify-content: center;
+}
+
+.btn-play-preview {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: transparent;
+  border: 2px solid var(--neon-primary);
+  color: var(--neon-primary);
+  font-size: 22px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow:
+    0 0 12px color-mix(in srgb, var(--neon-primary) 40%, transparent),
+    inset 0 0 10px color-mix(in srgb, var(--neon-primary) 08%, transparent);
+  transition: all 0.2s;
+  line-height: 1;
+}
+
+.btn-play-preview:hover {
+  background: color-mix(in srgb, var(--neon-primary) 15%, transparent);
+  box-shadow:
+    0 0 22px color-mix(in srgb, var(--neon-primary) 60%, transparent),
+    inset 0 0 16px color-mix(in srgb, var(--neon-primary) 15%, transparent);
+  transform: scale(1.06);
+}
+
+.recorder-preview-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+}
+
+.recorder-preview-actions .btn {
+  flex: 1;
+  max-width: 160px;
+}

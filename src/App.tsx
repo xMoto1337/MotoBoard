@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/tauri'
 import { open, save } from '@tauri-apps/api/dialog'
 import { readBinaryFile } from '@tauri-apps/api/fs'
+import { downloadDir } from '@tauri-apps/api/path'
 
 interface Sound {
   id: string
@@ -51,7 +52,7 @@ function App() {
   const [defaultVolume, setDefaultVolume] = useState(80)
   const [fadeInDuration, setFadeInDuration] = useState(0)
   const [fadeOutDuration, setFadeOutDuration] = useState(0)
-  const [showConsole, setShowConsole] = useState(true)
+  const [showConsole, setShowConsole] = useState(false)
   const [compactMode, setCompactMode] = useState(false)
   const [theme, setTheme] = useState<string>('green')
   const [minimizeToTray, setMinimizeToTray] = useState(false)
@@ -67,10 +68,28 @@ function App() {
   const [soundQueue, setSoundQueue] = useState<string[]>([])
   const [isQueuePlaying, setIsQueuePlaying] = useState(false)
   const [activeTab, setActiveTab] = useState<'soundboard' | 'tools'>('soundboard')
+  const [activeToolTab, setActiveToolTab] = useState<'converter' | 'recorder'>('converter')
   const [convertInput, setConvertInput] = useState('')
   const [convertOutput, setConvertOutput] = useState('')
   const [convertStatus, setConvertStatus] = useState<'idle' | 'converting' | 'done' | 'error'>('idle')
   const [convertResult, setConvertResult] = useState('')
+  // Voice Recorder state
+  const [inputDevices, setInputDevices] = useState<AudioDevice[]>([])
+  const [selectedInputDevice, setSelectedInputDevice] = useState<string>('')
+  const [recordOutput, setRecordOutput] = useState<string>('')
+  const [isRecordingActive, setIsRecordingActive] = useState<boolean>(false)
+  const [recordingTime, setRecordingTime] = useState<number>(0)
+  const [recordStatus, setRecordStatus] = useState<string>('')
+  const [recordStatusType, setRecordStatusType] = useState<'idle' | 'success' | 'error'>('idle')
+  const [recordLevels, setRecordLevels] = useState<number[]>(new Array(48).fill(0))
+  const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const recordLevelIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  // Preview playback state (after stopping, before saving)
+  const [recPreviewBlobUrl, setRecPreviewBlobUrl] = useState<string | null>(null)
+  const [isRecPreviewPlaying, setIsRecPreviewPlaying] = useState(false)
+  const [recPreviewTime, setRecPreviewTime] = useState(0)
+  const [recPreviewDuration, setRecPreviewDuration] = useState(0)
+  const recorderAudioRef = useRef<HTMLAudioElement | null>(null)
   const consoleRef = useRef<HTMLDivElement>(null)
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null)
   const previewAudioRef = useRef<HTMLAudioElement | null>(null)
@@ -788,6 +807,165 @@ function App() {
     }
   }
 
+  // ===== Voice Recorder =====
+  const loadInputDevices = async () => {
+    try {
+      const devices = await invoke<AudioDevice[]>('get_input_devices')
+      setInputDevices(devices)
+      addLog(`[Recorder] Found ${devices.length} input device(s)`, 'debug')
+    } catch (error) {
+      addLog(`[Recorder] Failed to load input devices: ${error}`, 'error')
+    }
+  }
+
+  const formatRecordingTime = (secs: number) => {
+    const m = Math.floor(secs / 60)
+    const s = secs % 60
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+  }
+
+  const startRecording = async () => {
+    try {
+      // Auto-generate output path if not set
+      if (!recordOutput) {
+        const dlDir = await downloadDir()
+        const now = new Date()
+        const ts = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}-${String(now.getMinutes()).padStart(2,'0')}-${String(now.getSeconds()).padStart(2,'0')}`
+        setRecordOutput(`${dlDir}Recording_${ts}.mp3`)
+      }
+
+      await invoke('start_recording', { deviceName: selectedInputDevice || null })
+      setIsRecordingActive(true)
+      setRecordingTime(0)
+      setRecordStatus('Recording...')
+      setRecordStatusType('idle')
+      addLog('[Recorder] Recording started', 'success')
+
+      recordTimerRef.current = setInterval(() => {
+        setRecordingTime(t => t + 1)
+      }, 1000)
+
+      recordLevelIntervalRef.current = setInterval(async () => {
+        try {
+          const level = await invoke<number>('get_recording_level')
+          const scaled = Math.min(level * 14, 1.0)
+          setRecordLevels(prev => [...prev.slice(1), scaled])
+        } catch {}
+      }, 80)
+    } catch (error) {
+      addLog(`[Recorder] Failed to start: ${error}`, 'error')
+      setRecordStatus(`Error: ${error}`)
+      setRecordStatusType('error')
+    }
+  }
+
+  const stopRecording = async () => {
+    if (!isRecordingActive) return
+
+    // Clear intervals immediately
+    if (recordTimerRef.current) { clearInterval(recordTimerRef.current); recordTimerRef.current = null }
+    if (recordLevelIntervalRef.current) { clearInterval(recordLevelIntervalRef.current); recordLevelIntervalRef.current = null }
+
+    setIsRecordingActive(false)
+    setRecordLevels(new Array(48).fill(0))
+    setRecordStatus('Processing...')
+    setRecordStatusType('idle')
+
+    try {
+      // Encode to temp file; return path for preview
+      const tempPath = await invoke<string>('finish_recording')
+
+      // Load audio into a Blob URL for in-app preview
+      const bytes = await readBinaryFile(tempPath)
+      const blob = new Blob([bytes as unknown as BlobPart], { type: 'audio/mpeg' })
+      const url = URL.createObjectURL(blob)
+
+      // Clean up any previous preview
+      if (recorderAudioRef.current) {
+        recorderAudioRef.current.pause()
+        recorderAudioRef.current = null
+      }
+      if (recPreviewBlobUrl) URL.revokeObjectURL(recPreviewBlobUrl)
+
+      const audio = new Audio(url)
+      audio.addEventListener('loadedmetadata', () => setRecPreviewDuration(audio.duration))
+      audio.addEventListener('timeupdate', () => setRecPreviewTime(audio.currentTime))
+      audio.addEventListener('ended', () => { setIsRecPreviewPlaying(false); setRecPreviewTime(0) })
+
+      recorderAudioRef.current = audio
+      setRecPreviewBlobUrl(url)
+      setRecPreviewTime(0)
+      setRecPreviewDuration(0)
+      setIsRecPreviewPlaying(false)
+      setRecordStatus('')
+      setRecordStatusType('idle')
+      addLog('[Recorder] Recording stopped — preview ready', 'success')
+    } catch (error) {
+      addLog(`[Recorder] Failed to process recording: ${error}`, 'error')
+      setRecordStatus(`Error: ${error}`)
+      setRecordStatusType('error')
+    }
+  }
+
+  const togglePreviewPlayback = () => {
+    const audio = recorderAudioRef.current
+    if (!audio) return
+    if (isRecPreviewPlaying) {
+      audio.pause()
+      setIsRecPreviewPlaying(false)
+    } else {
+      audio.play()
+      setIsRecPreviewPlaying(true)
+    }
+  }
+
+  const saveRecording = async () => {
+    try {
+      const selected = await save({
+        defaultPath: recordOutput || `Recording_${new Date().toISOString().slice(0, 10)}.mp3`,
+        filters: [{ name: 'MP3 Audio', extensions: ['mp3'] }]
+      })
+      if (!selected) return
+
+      await invoke('save_recording', { destPath: selected })
+      setRecordOutput(selected)
+      const filename = selected.split(/[\\/]/).pop() ?? selected
+      setRecordStatus(`Saved: ${filename}`)
+      setRecordStatusType('success')
+      addLog(`[Recorder] Saved: ${selected}`, 'success')
+    } catch (error) {
+      addLog(`[Recorder] Save failed: ${error}`, 'error')
+      setRecordStatus(`Save failed: ${error}`)
+      setRecordStatusType('error')
+    }
+  }
+
+  const discardRecording = () => {
+    if (recorderAudioRef.current) {
+      recorderAudioRef.current.pause()
+      recorderAudioRef.current = null
+    }
+    if (recPreviewBlobUrl) {
+      URL.revokeObjectURL(recPreviewBlobUrl)
+      setRecPreviewBlobUrl(null)
+    }
+    setRecPreviewTime(0)
+    setRecPreviewDuration(0)
+    setIsRecPreviewPlaying(false)
+    setRecordingTime(0)
+    setRecordStatus('')
+    setRecordStatusType('idle')
+  }
+
+  // Clean up recorder on unmount
+  useEffect(() => {
+    return () => {
+      if (recordTimerRef.current) clearInterval(recordTimerRef.current)
+      if (recordLevelIntervalRef.current) clearInterval(recordLevelIntervalRef.current)
+      if (recorderAudioRef.current) { recorderAudioRef.current.pause(); recorderAudioRef.current = null }
+    }
+  }, [])
+
   // Apply theme and compact mode to document
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -1046,7 +1224,145 @@ function App() {
       {activeTab === 'tools' && (
         <div className="tools-view">
           <div className="tools-container">
+            {/* Sub-tab navigation */}
+            <div className="tool-subtabs">
+              <button
+                className={`tool-subtab-btn ${activeToolTab === 'converter' ? 'active' : ''}`}
+                onClick={() => setActiveToolTab('converter')}
+              >
+                Media Converter
+              </button>
+              <button
+                className={`tool-subtab-btn ${activeToolTab === 'recorder' ? 'active' : ''}`}
+                onClick={() => { setActiveToolTab('recorder'); loadInputDevices() }}
+              >
+                Voice Recorder
+              </button>
+            </div>
+
+            {/* Voice Recorder */}
+            {activeToolTab === 'recorder' && (
+              <div className="tool-card">
+                <div className="tool-card-header">
+                  <div className="tool-icon">&#9679;</div>
+                  <div>
+                    <h2 className="tool-title">Voice Recorder</h2>
+                    <p className="tool-subtitle">Record from your microphone and save as MP3</p>
+                  </div>
+                </div>
+
+                <div className="recorder-section">
+                  {recPreviewBlobUrl ? (
+                    /* ── Preview mode: playback + save/discard ── */
+                    <div className="recorder-preview">
+                      <div className="recorder-preview-header">
+                        <span className="recorder-preview-label">Preview Recording</span>
+                        <span className="recorder-preview-dur">{formatRecordingTime(Math.floor(recPreviewDuration))}</span>
+                      </div>
+
+                      {/* Scrub bar */}
+                      <div
+                        className="recorder-preview-progress-wrap"
+                        onClick={(e) => {
+                          const audio = recorderAudioRef.current
+                          if (!audio || !recPreviewDuration) return
+                          const rect = e.currentTarget.getBoundingClientRect()
+                          audio.currentTime = ((e.clientX - rect.left) / rect.width) * recPreviewDuration
+                        }}
+                      >
+                        <div
+                          className="recorder-preview-progress-bar"
+                          style={{ width: recPreviewDuration ? `${(recPreviewTime / recPreviewDuration) * 100}%` : '0%' }}
+                        />
+                      </div>
+                      <div className="recorder-preview-time">
+                        <span>{formatRecordingTime(Math.floor(recPreviewTime))}</span>
+                        <span>{formatRecordingTime(Math.floor(recPreviewDuration))}</span>
+                      </div>
+
+                      {/* Play / Pause */}
+                      <div className="recorder-preview-controls">
+                        <button
+                          className="btn-play-preview"
+                          onClick={togglePreviewPlayback}
+                          title={isRecPreviewPlaying ? 'Pause' : 'Play'}
+                        >
+                          {isRecPreviewPlaying ? '⏸' : '▶'}
+                        </button>
+                      </div>
+
+                      {/* Save As / Record Again */}
+                      <div className="recorder-preview-actions">
+                        <button className="btn btn-outline" onClick={discardRecording}>
+                          Record Again
+                        </button>
+                        <button className="btn btn-primary" onClick={saveRecording}>
+                          Save As...
+                        </button>
+                      </div>
+
+                      {recordStatus && (
+                        <div className={`recorder-status${recordStatusType === 'success' ? ' success' : recordStatusType === 'error' ? ' error' : ''}`}>
+                          {recordStatus}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    /* ── Record mode ── */
+                    <>
+                      {/* Microphone selector */}
+                      <div className="recorder-device-row">
+                        <label>Microphone</label>
+                        <select
+                          className="device-select"
+                          value={selectedInputDevice}
+                          onChange={(e) => setSelectedInputDevice(e.target.value)}
+                          disabled={isRecordingActive}
+                        >
+                          <option value="">Default Microphone</option>
+                          {inputDevices.map((device) => (
+                            <option key={device.id} value={device.name}>
+                              {device.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Visualizer */}
+                      <div className="recorder-visualizer">
+                        {recordLevels.map((level, i) => (
+                          <div
+                            key={i}
+                            className={`recorder-vis-bar${isRecordingActive ? '' : ' idle'}`}
+                            style={{ height: isRecordingActive ? `${Math.max(level * 100, 4)}%` : '4%' }}
+                          />
+                        ))}
+                      </div>
+
+                      {/* Timer and record button */}
+                      <div className="recorder-center">
+                        <div className={`recorder-timer${isRecordingActive ? ' recording' : ''}`}>
+                          {formatRecordingTime(recordingTime)}
+                        </div>
+                        <button
+                          className={`btn-record${isRecordingActive ? ' recording' : ''}`}
+                          onClick={isRecordingActive ? stopRecording : startRecording}
+                          title={isRecordingActive ? 'Stop recording' : 'Start recording'}
+                        >
+                          <div className="btn-record-icon" />
+                        </button>
+                        <div className={`recorder-status${recordStatusType === 'success' ? ' success' : recordStatusType === 'error' ? ' error' : ''}`}>
+                          {recordStatus}
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* Video/Audio to WAV Converter */}
+            {activeToolTab === 'converter' && (
             <div className="tool-card">
               <div className="tool-card-header">
                 <div className="tool-icon">&#9835;</div>
@@ -1176,6 +1492,7 @@ function App() {
                 )}
               </div>
             </div>
+            )}
           </div>
         </div>
       )}
